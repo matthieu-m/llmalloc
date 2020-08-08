@@ -39,7 +39,7 @@ impl<C> ThreadLocal<C>
     /// Flushes all the memory retained by the current instance.
     pub(crate) fn flush<F>(&self, mut recycler: F)
         where
-            F: FnMut(*mut LargePage) -> ()
+            F: FnMut(*mut LargePage)
     {
         //  The order in which the pages and foreign allocations are returned is inconsequential as it is guaranteed
         //  that the foreign allocations do not belong to the local pages.
@@ -368,7 +368,7 @@ struct HugePageStore([usize; 16384]);
 
 impl HugePageStore {
     /// Creates a Recycler, which will memorize the recycled pages.
-    fn recycler<'a>(&'a self, recycled: &'a mut [usize]) -> impl FnMut(*mut LargePage) -> () + 'a {
+    fn recycler<'a>(&'a self, recycled: &'a mut [usize]) -> impl FnMut(*mut LargePage) + 'a {
         let mut i = 0;
         move |large_page| {
             let r = unsafe { self.recycle(large_page) };
