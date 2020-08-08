@@ -12,8 +12,10 @@ use crate::internals::{cells, large_page::LargePage};
 /// Thread-local caching to speed up Normal allocations.
 #[repr(C)]
 pub(crate) struct ThreadLocal<C> {
+    //  Owner (socket).
+    owner: *mut (),
     //  Locally cached pages, 1 per class-size.
-    local_pages: [LargePagePtr; 64],
+    local_pages: [LargePagePtr; 63],
     //  Foreign allocations, temporarily stored here to minimize touching another thread's cache lines.
     foreign_allocations: [cells::CellForeignList; 8],
     _configuration: marker::PhantomData<C>,
@@ -24,17 +26,20 @@ impl<C> ThreadLocal<C>
         C: Configuration
 {
     /// Creates an instance.
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(owner: *mut ()) -> Self {
         //  Safety:
         //  -   Pointers can safely be zeroed.
-        let local_pages: [LargePagePtr; 64] = unsafe { mem::zeroed() };
+        let local_pages: [LargePagePtr; 63] = unsafe { mem::zeroed() };
         let foreign_allocations = Default::default();
         let _configuration = marker::PhantomData;
 
         assert!(local_pages.len() >= ClassSize::number_classes(C::LARGE_PAGE_SIZE));
 
-        Self { local_pages, foreign_allocations, _configuration, }
+        Self { owner, local_pages, foreign_allocations, _configuration, }
     }
+
+    /// Returns the owner.
+    pub(crate) fn owner(&self) -> *mut () { self.owner }
 
     /// Flushes all the memory retained by the current instance.
     pub(crate) fn flush<F>(&self, mut recycler: F)
@@ -334,7 +339,7 @@ impl<C> Default for ThreadLocal<C>
     where
         C: Configuration
 {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self { Self::new(ptr::null_mut()) }
 }
 
 
@@ -522,7 +527,7 @@ fn size() {
 
 #[test]
 fn new() {
-    TestThreadLocal::new();
+    TestThreadLocal::default();
 }
 
 #[test]
@@ -533,7 +538,7 @@ fn flush() {
 
     let store = HugePageStore::default();
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
 
     thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(unsafe { store.provide(LOCAL_PAGE, CLASS_SIZE) });
 
@@ -563,7 +568,7 @@ fn allocate_fast() {
     let store = HugePageStore::default();
     let local_page = unsafe { store.provide(LOCAL_PAGE, CLASS_SIZE) };
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
 
     thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(local_page);
 
@@ -582,7 +587,7 @@ fn allocate_slow_initial() {
     let store = HugePageStore::default();
     let local_page = unsafe { store.provide(LOCAL_PAGE, CLASS_SIZE) };
 
-    let thread_local = TestThreadLocal::new();
+    let thread_local = TestThreadLocal::default();
 
     let p = unsafe {
         thread_local.allocate(CLASS_SIZE, |class_size| {
@@ -611,7 +616,7 @@ fn allocate_slow_initial() {
 fn allocate_slow_initial_provider_exhausted() {
     const CLASS_SIZE: ClassSize = ClassSize::new(3);
 
-    let thread_local = TestThreadLocal::new();
+    let thread_local = TestThreadLocal::default();
 
     //  Attempt to allocate from a null page, triggering a change of page.
     let p = unsafe { thread_local.allocate(CLASS_SIZE, |_| { ptr::null_mut() }) };
@@ -638,7 +643,7 @@ fn allocate_slow_exhausted() {
     //  Exaused `second_page`, stopping short of triggering the null allocation.
     unsafe { store.exhaust(&*second_page, FIRST_PAGE) };
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
     thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(second_page);
 
     //  Attempt to allocate from an empty page, triggering a change of page.
@@ -677,7 +682,7 @@ fn allocate_slow_exhausted_provider_exhausted() {
     //  Exaused `second_page`, stopping short of triggering the null allocation.
     unsafe { store.exhaust(&*second_page, FIRST_PAGE) };
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
     thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(second_page);
 
     //  Attempt to allocate from an empty page, triggering a change of page.
@@ -707,7 +712,7 @@ fn allocate_slow_exhausted_recover_foreign() {
     //  Exaused `second_page`, stopping short of triggering the null allocation.
     unsafe { store.exhaust(&*second_page, FIRST_PAGE) };
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
     thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(second_page);
 
     thread_local.foreign_allocations[FOREIGN_LIST] = unsafe { store.create_foreign_list(THIRD_PAGE, 3) };
@@ -762,7 +767,7 @@ fn deallocate_local() {
     let store = HugePageStore::default();
     let local_page = unsafe { store.provide(LOCAL_PAGE, CLASS_SIZE) };
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
     thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(local_page);
 
     let p = unsafe { thread_local.allocate(CLASS_SIZE, |_| panic!("No provider!")) };
@@ -786,7 +791,7 @@ fn deallocate_foreign_no_local() {
     let flush_threshold = unsafe { (*foreign_page).flush_threshold() };
     assert!(flush_threshold > 5, "{} <= 5", flush_threshold);
 
-    let thread_local = TestThreadLocal::new();
+    let thread_local = TestThreadLocal::default();
 
     let mut allocated = [ptr::null_mut(); 5];
     for p in &mut allocated {
@@ -811,7 +816,7 @@ fn deallocate_foreign_with_local() {
     let local_page = unsafe { store.provide(LOCAL_PAGE, CLASS_SIZE) };
     let foreign_page = unsafe { store.provide(FOREIGN_PAGE, CLASS_SIZE) };
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
     thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(local_page);
 
     let mut allocated = [ptr::null_mut(); 5];
@@ -855,7 +860,7 @@ fn deallocate_foreign_recycle_immediate() {
         (*foreign_page).refill_foreign(&foreign_list, |_| panic!("No recycler!"));
     }
 
-    let thread_local = TestThreadLocal::new();
+    let thread_local = TestThreadLocal::default();
 
     //  Provokes flush, which provokes a catch!
     let mut recycled = [0; 1];
@@ -897,7 +902,7 @@ fn deallocate_foreign_recycle_foreign() {
         (*foreign_page).refill_foreign(&foreign_list, |_| panic!("No recycler!"));
     }
 
-    let thread_local = TestThreadLocal::new();
+    let thread_local = TestThreadLocal::default();
 
     for p in &allocated[..(FLUSH_TRESHOLD - 1)] {
         unsafe { thread_local.deallocate(*p, |_| panic!("No recycler!")) };
@@ -929,7 +934,7 @@ fn deallocate_foreign_last_list() {
     unsafe { store.provide(THIRD_PAGE, CLASS_SIZE) };
     unsafe { store.provide(FOURTH_PAGE, CLASS_SIZE) };
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
     thread_local.foreign_allocations[0] = unsafe { store.create_foreign_list(SECOND_PAGE, 3) };
     thread_local.foreign_allocations[1] = unsafe { store.create_foreign_list(THIRD_PAGE, 3) };
     thread_local.foreign_allocations[3] = unsafe { store.create_foreign_list(FOURTH_PAGE, 3) };
@@ -958,7 +963,7 @@ fn deallocate_foreign_kick_out_longest_list() {
     let other = HugePageStore::default();
     let foreign_page = unsafe { store.provide(FOREIGN_PAGE, CLASS_SIZE) };
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
 
     unsafe {
         let bound = LONGEST_LIST + 1;
@@ -997,7 +1002,7 @@ fn deallocate_foreign_recycle_longest_list() {
     let catch_threshold = unsafe { (*foreign_page).catch_threshold() };
     assert!(catch_threshold > 3, "{} <= 3", catch_threshold);
 
-    let mut thread_local = TestThreadLocal::new();
+    let mut thread_local = TestThreadLocal::default();
 
     unsafe {
         let bound = LONGEST_LIST + 1;

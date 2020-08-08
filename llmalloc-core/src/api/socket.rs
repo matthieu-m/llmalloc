@@ -29,8 +29,8 @@ where
     P: Platform,
 {
     /// Creates a new instance of SocketHandle.
-    pub fn new(huge: &'a DomainHandle<C, P>) -> Option<Self> {
-        SocketLocal::bootstrap(huge.as_raw()).map(SocketHandle)
+    pub fn new(domain: &'a DomainHandle<C, P>) -> Option<Self> {
+        SocketLocal::bootstrap(domain.as_raw()).map(SocketHandle)
     }
 
     /// Returns whether the layout is valid, or not, for use with `SocketLocal`.
@@ -142,6 +142,11 @@ where
     }
 }
 
+impl<'a, C, P> SocketHandle<'a, C, P> {
+    /// Creates a new instance from its content.
+    pub(crate) fn from(socket: ptr::NonNull<SocketLocal<'a, C, P>>) -> Self { SocketHandle(socket) }
+}
+
 impl<'a, C, P> Clone for SocketHandle<'a, C, P> {
     fn clone(&self) -> Self { *self }
 }
@@ -161,6 +166,9 @@ impl<'a, C, P> Copy for SocketHandle<'a, C, P> {}
 pub struct AtomicSocketHandle<'a, C, P>(atomic::AtomicPtr<SocketLocal<'a, C, P>>);
 
 impl <'a, C, P> AtomicSocketHandle<'a, C, P> {
+    /// Creates a null instance.
+    pub const fn new() -> Self { Self(atomic::AtomicPtr::new(ptr::null_mut())) }
+
     /// Initializes the instance with the given handle.
     ///
     /// If `self` is NOT currently None, then the initialization fails and the `handle` is returned.

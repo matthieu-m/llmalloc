@@ -12,7 +12,7 @@
 
 use core::ptr;
 
-use crate::Configuration;
+use crate::{Configuration, SocketHandle};
 use crate::internals::thread_local::ThreadLocal;
 
 /// Handle to thread-local cache.
@@ -22,6 +22,32 @@ impl<C> ThreadHandle<C>
     where
         C: Configuration
 {
+    /// Rematerialize from raw pointer.
+    ///
+    /// #   Safety
+    ///
+    /// -   Assumes `pointer` points to a valid instance of `ThreadHandle<C>`
+    pub unsafe fn from_pointer(pointer: *mut u8) -> ThreadHandle<C> {
+        debug_assert!(!pointer.is_null());
+
+        Self::new(ptr::NonNull::new_unchecked(pointer).cast())
+    }
+
+    /// Turn into raw pointer.
+    pub fn into_pointer(self) -> *mut u8 { self.0.as_ptr() as *mut u8 }
+
+    /// Get associated SocketHandle.
+    ///
+    /// #   Safety
+    ///
+    /// -   Assumes that the lifetime and platform are correct.
+    pub unsafe fn socket<'a, P>(&self) -> SocketHandle<'a, C, P> {
+        let socket = self.0.as_ref().owner();
+        debug_assert!(!socket.is_null());
+
+        SocketHandle::from(ptr::NonNull::new_unchecked(socket).cast())
+    }
+
     /// Creates an instance.
     pub(crate) fn new(value: ptr::NonNull<ThreadLocal<C>>) -> Self { Self(value) }
 

@@ -6,7 +6,7 @@
 //! The Huge Allocations Manager bridges the gap by recording the original layout on allocation and providing back on
 //! deallocation.
 
-use core::{alloc::Layout, cmp, marker, mem, ptr, sync::atomic};
+use core::{alloc::Layout, cmp, marker, ptr, sync::atomic};
 
 use crate::{Configuration, Platform, PowerOf2};
 use crate::utils;
@@ -23,8 +23,29 @@ pub(crate) struct HugeAllocator<C, P> {
 
 impl<C, P> HugeAllocator<C, P> {
     /// Creates a new instance.
-    pub(crate) fn new(platform: P) -> Self {
-        let allocations = unsafe { mem::zeroed() };
+    pub(crate) const fn new(platform: P) -> Self {
+        const fn aha<C>() -> AtomicHugeAllocation<C> { AtomicHugeAllocation::new() }
+
+        //  Replace with mem::zeroed once const on stable.
+        let allocations = [
+            //  Line 0: up to 16 instances.
+            aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(),
+            //  Line 1: up to 32 instances.
+            aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(),
+            //  Line 2: up to 48 instances.
+            aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(),
+            //  Line 4: up to 64 instances.
+            aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(),
+            //  Line 5: up to 80 instances.
+            aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(),
+            //  Line 6: up to 96 instances.
+            aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(),
+            //  Line 7: up to 112 instances.
+            aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(),
+            //  Line 8: up to 128 instances.
+            aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(),
+        ];
+
         let _configuration = marker::PhantomData;
 
         Self { allocations, platform, _configuration, }
@@ -176,6 +197,11 @@ unsafe impl<C, P> Sync for HugeAllocator<C, P> {}
 //  A compressed representation of a pointer to a HugePage and the number of HugePages.
 struct AtomicHugeAllocation<C>(atomic::AtomicUsize, marker::PhantomData<*const C>);
 
+impl<C> AtomicHugeAllocation<C> {
+    /// Returns an instance.
+    const fn new() -> Self { Self(atomic::AtomicUsize::new(0), marker::PhantomData) }
+}
+
 impl<C> AtomicHugeAllocation<C>
     where
         C: Configuration,
@@ -250,9 +276,11 @@ impl<C> Default for HugeAllocation<C> {
 #[cfg(test)]
 mod tests {
 
-use super::*;
+use core::mem;
 
 use crate::PowerOf2;
+
+use super::*;
 
 type Allocator = HugeAllocator<TestConfiguration, TestPlatform>;
 type Allocation = HugeAllocation<TestConfiguration>;

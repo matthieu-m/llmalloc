@@ -1,7 +1,9 @@
 [package]
-name = "llmalloc-core"
+name = "llmalloc"
 version = "0.1.0"
 authors = ["Matthieu M. <matthieum.147192@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+
+llmalloc-core = { path = "../llmalloc-core" }

@@ -89,7 +89,7 @@ where
 
         let (socket_place, thread_locals_place) = place.split_at_mut(mem::size_of::<Self>());
 
-        let thread_locals = ThreadLocalsManager::new(thread_locals_place);
+        let thread_locals = ThreadLocalsManager::new(socket_place.as_mut_ptr() as *mut (), thread_locals_place);
 
         //  Safety:
         //  -   `socket_place` is sufficiently sized.
@@ -640,6 +640,8 @@ impl<C, P> Default for HugePagesManager<C, P> {
 
 //  Manager of Thread Locals.
 struct ThreadLocalsManager<C> {
+    //  Owner.
+    owner: *mut (),
     //  Stack of available thread-locals.
     stack: CellForeignStack,
     //  Current watermark for fresh allocations into the buffer area.
@@ -657,7 +659,7 @@ impl<C> ThreadLocalsManager<C>
     const THREAD_LOCAL_SIZE: usize = mem::size_of::<GuardedThreadLocal<C>>();
 
     //  Creates an instance which will carve-up the memory of `place` into `ThreadLocals`.
-    fn new(buffer: &mut [u8]) -> Self {
+    fn new(owner: *mut (), buffer: &mut [u8]) -> Self {
         let _configuration = marker::PhantomData;
 
         //  Safety:
@@ -675,7 +677,7 @@ impl<C> ThreadLocalsManager<C>
 
         let stack = CellForeignStack::default();
 
-        Self { stack, watermark, end, _configuration, }
+        Self { owner, stack, watermark, end, _configuration, }
     }
 
     //  Acquires a ThreadLocal, if possible.
@@ -685,7 +687,7 @@ impl<C> ThreadLocalsManager<C>
             //  Safety:
             //  -   `thread_local` is valid for writes.
             //  -   `thread_local` is properly aligned.
-            unsafe { ptr::write(thread_local.as_ptr(), ThreadLocal::default()) };
+            unsafe { ptr::write(thread_local.as_ptr(), ThreadLocal::new(self.owner)) };
 
             return Some(thread_local);
         }
@@ -720,7 +722,7 @@ impl<C> ThreadLocalsManager<C>
         //  Safety:
         //  -   `current` is valid for writes.
         //  -   `current` is properly aligned.
-        unsafe { ptr::write(current, GuardedThreadLocal::default()) };
+        unsafe { ptr::write(current, GuardedThreadLocal::new(self.owner)) };
 
         //  Safety:
         //  -   `current` is exclusive.
@@ -757,6 +759,7 @@ impl<C> ThreadLocalsManager<C>
 impl<C> Default for ThreadLocalsManager<C> {
     fn default() -> Self {
         Self {
+            owner: ptr::null_mut(),
             stack: CellForeignStack::default(),
             watermark: atomic::AtomicPtr::new(ptr::null_mut()),
             end: ptr::null_mut(),
@@ -791,11 +794,20 @@ struct GuardedThreadLocal<C>{
     thread_local: ThreadLocal<C>,
 }
 
+impl<C> GuardedThreadLocal<C>
+    where
+        C: Configuration
+{
+    fn new(owner: *mut ()) -> Self {
+        GuardedThreadLocal { _guard: Default::default(), thread_local: ThreadLocal::new(owner) }
+    }
+}
+
 impl<C> Default for GuardedThreadLocal<C>
     where
         C: Configuration
 {
-    fn default() -> Self { GuardedThreadLocal { _guard: Default::default(), thread_local: Default::default() } }
+    fn default() -> Self { Self::new(ptr::null_mut()) }
 }
 
 #[cfg(test)]
@@ -928,7 +940,7 @@ impl ThreadLocalsStore {
     unsafe fn create(&self) -> TestThreadLocalsManager {
         let buffer = slice::from_raw_parts_mut(self.0.as_ptr() as *mut _, self.0.len());
 
-        ThreadLocalsManager::new(buffer)
+        ThreadLocalsManager::new(ptr::null_mut(), buffer)
     }
 }
 

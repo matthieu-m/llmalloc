@@ -30,8 +30,12 @@ impl<C, P> DomainHandle<C, P> {
     /// Creates a Domain.
     ///
     /// The Domain created will allocate memory from the `platform`, and return it to the `platform`.
-    pub fn new(platform: P) -> Self { Self(HugeAllocator::new(platform)) }
+    pub const fn new(platform: P) -> Self { Self(HugeAllocator::new(platform)) }
 
+    /// Returns a reference to the underlying platform.
+    pub fn platform(&self) -> &P { self.0.platform() }
+
+    /// Returns a reference to the raw handle.
     pub(crate) fn as_raw(&self) -> &HugeAllocator<C, P> { &self.0 }
 }
 
