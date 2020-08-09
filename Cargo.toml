@@ -2,5 +2,6 @@
 
 members = [
     "llmalloc-core",
-    "llmalloc"
+    "llmalloc",
+    "llmalloc-c",
 ]

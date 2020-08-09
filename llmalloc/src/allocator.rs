@@ -7,9 +7,13 @@ use llmalloc_core::{self, Layout};
 use crate::{LLConfiguration, Platform, LLPlatform, ThreadLocal, LLThreadLocal};
 
 /// Low-Latency Allocator.
+#[derive(Default)]
 pub struct LLAllocator;
 
 impl LLAllocator {
+    /// Creates an instance.
+    pub const fn new() -> Self { Self }
+
     /// Prepares the socket-local and thread-local structures for allocation.
     ///
     /// Returns Ok if the attempt succeeded, Err otherwise.
