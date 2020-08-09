@@ -140,6 +140,28 @@ where
 
         socket_local.deallocate(thread_local, ptr)
     }
+
+    /// Deallocates the supplied block of memory.
+    ///
+    /// Unlike `deallocate`, the pointer is not cached for reuse on the local thread; as a result, this call may be
+    /// slightly more costly.
+    ///
+    /// #   Safety
+    ///
+    /// The caller should no longer reference the memory after calling this function.
+    ///
+    /// `deallocate` assumes that:
+    /// -   `thread_handle` is not concurrently accessed by another thread.
+    /// -   `thread_handle` belongs to this socket.
+    /// -   `ptr` is a value allocated by an instance of `Self`, and the same underlying `Platform`.
+    #[inline(always)]
+    pub unsafe fn deallocate_uncached(&self, ptr: *mut u8) {
+        //  Safety:
+        //  -   Local lifetime.
+        let socket_local = self.0.as_ref();
+
+        socket_local.deallocate_uncached(ptr)
+    }
 }
 
 impl<'a, C, P> SocketHandle<'a, C, P> {

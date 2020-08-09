@@ -16,7 +16,7 @@ use core::{alloc::Layout, cmp, marker, mem, num, ptr, slice, sync::atomic};
 
 use crate::{Category, ClassSize, Configuration, Platform, PowerOf2, Properties};
 use crate::internals::{
-    cells::{CellForeign, CellForeignStack},
+    cells::{CellForeign, CellForeignList, CellForeignStack},
     huge_allocator::HugeAllocator,
     huge_page::HugePage,
     large_page::{LargePage, LargePageStack},
@@ -200,6 +200,27 @@ where
         }
     }
 
+    /// Deallocates the supplied block of memory.
+    ///
+    /// Unlike `deallocate`, the pointer is not cached for reuse on the local thread; as a result, this call may be
+    /// slightly more costly.
+    ///
+    /// #   Safety
+    ///
+    /// The caller should no longer reference the memory after calling this function.
+    ///
+    /// `deallocate` assumes that:
+    /// -   `thread_local` is not concurrently accessed by another thread.
+    /// -   `ptr` is a value allocated by an instance of `Self`, and the same underlying `Platform`.
+    #[inline(always)]
+    pub(crate) unsafe fn deallocate_uncached(&self, ptr: *mut u8) {
+        match Properties::<C>::category_of_pointer(ptr) {
+            Category::Normal => self.deallocate_normal_uncached(ptr),
+            Category::Large => self.deallocate_large(ptr),
+            Category::Huge => self.deallocate_huge(ptr),
+        }
+    }
+
     //  Internal; Creates a new instance of SocketLocal.
     fn new(huge_allocator: &'a HugeAllocator<C, P>) -> Self {
         let large_pages = unsafe { mem::zeroed() };
@@ -274,6 +295,38 @@ where
         //  Safety:
         //  -   `thread_local` is assumed not be accessed concurrently from another thread.
         thread_local.deallocate(ptr, |page| Self::catch_large_page(page));
+    }
+
+    //  Internal; Deallocates a Large allocation.
+    //
+    //  #   Safety
+    //
+    //  -   Assumes that `ptr` is a Normal allocation allocated by an instance of `Self`.
+    #[inline(never)]
+    unsafe fn deallocate_normal_uncached(&self, ptr: *mut u8) {
+        debug_assert!((ptr as usize) % C::LARGE_PAGE_SIZE != 0);
+        debug_assert!(!ptr.is_null());
+
+        //  Safety:
+        //  -   `ptr` is assumed to point to memory that is no longer in use.
+        //  -   `ptr` is assumed to point to a sufficiently large memory area.
+        //  -   `ptr` is assumed to be correctly aligned.
+        let cell = CellForeign::initialize(ptr);
+
+        let foreign_list = CellForeignList::default();
+        foreign_list.push(cell);
+
+        //  Safety:
+        //  -   `ptr` is assumed to belong to a `LargePage`.
+        let page = LargePage::from_raw::<C>(ptr);
+        debug_assert!(!page.is_null());
+
+        //  Safety:
+        //  -   `page` is not null.
+        let large_page = &*page;
+
+        large_page.refill_foreign(&foreign_list, |page| Self::catch_large_page(page));
+        debug_assert!(foreign_list.is_empty());
     }
 
     //  Internal; Allocates a Large allocation.

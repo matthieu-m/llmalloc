@@ -332,6 +332,7 @@ impl<C> ThreadLocal<C>
         }
 
         large_page.refill_foreign(foreign_list, recycler);
+        debug_assert!(foreign_list.is_empty());
     }
 }
 

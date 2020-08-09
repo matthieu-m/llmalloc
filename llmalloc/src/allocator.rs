@@ -69,7 +69,7 @@ impl LLAllocator {
 
         //  If a non-null pointer exists, it _must_ have been allocated, and therefore there should be at least one
         //  non-null socket-handle, somewhere, through which the memory can be returned.
-        todo!("Add way to directly return memory via SocketHandle, without ThreadHandle");
+        Sockets::any_socket_handle().deallocate_uncached(pointer);
     }
 }
 
@@ -178,8 +178,19 @@ impl Sockets {
 
     //  Returns a SocketHandle for this particular NUMA Node.
     #[cold]
+    #[inline(never)]
     fn socket_handle() -> Option<SocketHandle> { SOCKETS.socket_handle_impl() }
 
+    //  Returns the first SocketHandle it finds.
+    //
+    //  #   Panics
+    //
+    //  If no handle has been allocated.
+    #[cold]
+    #[inline(never)]
+    fn any_socket_handle() -> SocketHandle { SOCKETS.any_socket_handle_impl() }
+
+    //  Internal; returns a SocketHandle, initialized if need be.
     #[cold]
     fn socket_handle_impl(&self) -> Option<SocketHandle> {
         let index = Self::current_node();
@@ -203,6 +214,18 @@ impl Sockets {
 
         //  If the race was won, it's initialized, otherwise, it's initialized!
         atomic_handle.load()
+    }
+
+    //  Internal; returns the first SocketHandle it finds, or panics if it finds none.
+    #[cold]
+    fn any_socket_handle_impl(&self) -> SocketHandle {
+        for atomic_handle in &self.0[..] {
+            if let Some(socket_handle) = atomic_handle.load() {
+                return socket_handle;
+            }
+        }
+
+        unreachable!("How can memory need be deallocated, if no socket handle was ever allocated?");
     }
 
     #[cold]
