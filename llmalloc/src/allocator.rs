@@ -1,6 +1,6 @@
 //! Allocator
 
-use core::ptr;
+use core::{alloc, ptr};
 
 use llmalloc_core::{self, Layout};
 
@@ -75,6 +75,12 @@ impl LLAllocator {
         //  non-null socket-handle, somewhere, through which the memory can be returned.
         Sockets::any_socket_handle().deallocate_uncached(pointer);
     }
+}
+
+unsafe impl alloc::GlobalAlloc for LLAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { self.allocate(layout) }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _: Layout) { self.deallocate(ptr) }
 }
 
 //
