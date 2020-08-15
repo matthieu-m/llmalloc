@@ -9,6 +9,11 @@ use core::{mem, num, ops};
 pub struct PowerOf2(num::NonZeroUsize);
 
 impl PowerOf2 {
+    /// 1 as a PowerOf2 instance.
+    //  Safety:
+    //  -   1 is a power of 2.
+    pub const ONE: PowerOf2 = unsafe { PowerOf2::new_unchecked(1) };
+
     /// Creates a new instance of PowerOf2.
     ///
     /// Or nothing if the value is not a power of 2.
@@ -59,6 +64,7 @@ impl PowerOf2 {
 }
 
 impl ops::Div for PowerOf2 {
+    //  Cannot be PowerOf2, because it could yield 0.
     type Output = usize;
 
     fn div(self, rhs: PowerOf2) -> usize { self.value() / rhs }

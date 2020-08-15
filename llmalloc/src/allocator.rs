@@ -2,7 +2,7 @@
 
 use core::{alloc, ptr};
 
-use llmalloc_core::{self, Layout};
+use llmalloc_core::{self, Configuration, Layout, PowerOf2};
 
 use crate::{LLConfiguration, Platform, LLPlatform, ThreadLocal, LLThreadLocal};
 
@@ -48,6 +48,29 @@ impl LLAllocator {
     ///
     /// If allocation fails, the returned pointer may be NULL.
     pub fn allocate(&self, layout: Layout) -> *mut u8 {
+        debug_assert!(layout.align().count_ones() == 1);
+
+        if layout.align() > LLConfiguration::HUGE_PAGE_SIZE.value() {
+            return ptr::null_mut();
+        }
+
+        //  Safety:
+        //  -   `layout.align()` is a power of 2.
+        let align = unsafe { PowerOf2::new_unchecked(layout.align()) };
+
+        //  Round up size to a multiple of `align`, if not already.
+        let layout = if layout.size() % align == 0 {
+            layout
+        } else {
+            let size = align.round_up(layout.size());
+
+            //  Safety:
+            //  -   `align` is not 0.
+            //  -   `align` is a power of 2.
+            //  -   `size` is rounded up to a multiple of `align`, without overflow.
+            unsafe { Layout::from_size_align_unchecked(size, align.value()) }
+        };
+
         if let Some(thread_local) = Thread::get().or_else(Thread::initialize) {
             return thread_local.allocate(layout);
         }

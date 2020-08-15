@@ -545,8 +545,6 @@ impl<C, P> HugePagesManager<C, P>
     //  -   Assumes that `layout` is valid, as per `Self::is_valid_layout`.
     #[inline(never)]
     unsafe fn allocate_large(&self, layout: Layout, owner: *mut (), platform: &P) -> *mut u8 {
-        let size = layout.size();
-
         let mut first_null = self.0.len();
 
         //  Check if any existing page can accomodate the request.
@@ -563,7 +561,7 @@ impl<C, P> HugePagesManager<C, P>
             //  -   `huge_page` is not null.
             let huge_page = &*huge_page;
 
-            let result = huge_page.allocate(size);
+            let result = huge_page.allocate(layout);
 
             if !result.is_null() {
                 return result;
@@ -581,7 +579,7 @@ impl<C, P> HugePagesManager<C, P>
         let result = if !fresh_page.is_null() {
             //  Safety:
             //  -   `fresh_page` is not null.
-            (&*fresh_page).allocate(size)
+            (&*fresh_page).allocate(layout)
         } else {
             ptr::null_mut()
         };
@@ -610,7 +608,7 @@ impl<C, P> HugePagesManager<C, P>
             //  -   `huge_page` is not null.
             let huge_page = &*huge_page;
 
-            let result = huge_page.allocate(size);
+            let result = huge_page.allocate(layout);
 
             //  There is room! Release the newly acquired `fresh_page`, for now.
             if !result.is_null() {

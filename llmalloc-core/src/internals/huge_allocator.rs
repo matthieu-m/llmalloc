@@ -90,7 +90,10 @@ impl<C, P> HugeAllocator<C, P>
             return result;
         }
 
-        if self.push_allocation(result, size) {
+        //  Safety:
+        //  -   `size` is <= `HugeAllocation::<C>::MAX_SIZE`.
+        //  -   `size` is >= `C::HUGE_PAGE_SIZE`.
+        if unsafe { self.push_allocation(result, size) } {
             return result;
         }
 
@@ -136,7 +139,7 @@ impl<C, P> HugeAllocator<C, P>
     //  -   Assumes that `size` is less than or equal to `MAX_SIZE`.
     //  -   Assumes that `size` is strictly greater than `C::HUGE_PAGE_SIZE`.
     #[must_use]
-    fn push_allocation(&self, ptr: *mut u8, size: usize) -> bool {
+    unsafe fn push_allocation(&self, ptr: *mut u8, size: usize) -> bool {
         //  Optimize storage of single huge pages.
         if size == C::HUGE_PAGE_SIZE.value() {
             return true;
@@ -145,7 +148,7 @@ impl<C, P> HugeAllocator<C, P>
         //  Safety:
         //  -   `size` is less than or equal to `HugeAllocation::MAX_SIZE`.
         //  -   `size` is greater than or equal to `C::HUGE_PAGE_SIZE`.
-        let allocation = unsafe { HugeAllocation::new(ptr, size) };
+        let allocation = HugeAllocation::new(ptr, size);
 
         let null = HugeAllocation::default();
 
@@ -237,7 +240,7 @@ impl<C> HugeAllocation<C>
     ///
     /// #   Safety
     ///
-    /// -   Assumes that `size` is strictly less than `MAX_SIZE`.
+    /// -   Assumes that `size` is less than or equal to `MAX_SIZE`.
     /// -   Assumes that `size` is zero or greater than or equal to `C::HUGE_PAGE_SIZE`.
     unsafe fn new(ptr: *mut u8, size: usize) -> Self {
         debug_assert!(utils::is_sufficiently_aligned_for(ptr, C::HUGE_PAGE_SIZE),
