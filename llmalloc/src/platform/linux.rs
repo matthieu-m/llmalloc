@@ -54,11 +54,13 @@ impl Platform for LLPlatform {
     #[cold]
     #[inline(never)]
     fn current_node(&self) -> NumaNodeIndex {
-        let mut cpu = 0u32;
-        let mut node = 0u32;
-        unsafe { getcpu(&mut cpu as *mut _, &mut node as *mut _, ptr::null_mut()) };
+        let cpu = unsafe { sched_getcpu() };
+        let node = unsafe { numa_node_of_cpu(cpu) };
 
-        select_node(NumaNodeIndex::new(node))
+        assert!(cpu >= 0, "Expected CPU index, got {}", cpu);
+        assert!(node >= 0, "Expected NUMA Node index, got {}", node);
+
+        select_node(NumaNodeIndex::new(node as u32))
     }
 }
 
@@ -193,12 +195,10 @@ unsafe fn mmap_simplified(size: usize) -> *mut u8 {
 
 #[link(name = "c")]
 extern "C" {
-    //  Returns the current index of the CPU and NUMA node on which the thread is executed.
+    //  Returns the current index of the CPU on which the thread is executed.
     //
-    //  `_tcache` is a legacy parameter, no longer used, and should be null.
-    //
-    //  The only possible error is EFAULT, for arguments pointing outside the address space.
-    fn getcpu(cpu: *mut u32, node: *mut u32, _tcache: *mut u8) -> i32;
+    //  The only possible error is ENOSYS, if the kernel does not implement getcpu.
+    fn sched_getcpu() -> i32;
 
     //  Refer to: https://man7.org/linux/man-pages/man2/mmap.2.html
     fn mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, offset: isize) -> *mut u8;
@@ -209,6 +209,9 @@ extern "C" {
 
 #[link(name = "numa")]
 extern "C" {
+    //  Returns the NUMA node corresponding to a CPU, or -1 if the CPU is invalid.
+    fn numa_node_of_cpu(cpu: i32) -> i32;
+
     //  Returns the distance between two NUMA nodes.
     //
     //  A node has a distance 10 to itself; factors should be multiples of 10, although 11 and 21 has been observed.

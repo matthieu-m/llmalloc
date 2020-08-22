@@ -7,3 +7,12 @@ edition = "2018"
 [dependencies]
 
 llmalloc-core = { path = "../llmalloc-core" }
+
+[dev-dependencies]
+
+criterion = "0.3"
+
+[[bench]]
+
+name = "benchmark"
+harness = false
