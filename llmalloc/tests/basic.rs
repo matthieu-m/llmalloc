@@ -7,11 +7,5 @@ fn warm_up() {
 }
 
 //  FIXME: use sys crates... properly configured for system libraries.
-#[link(name = "c")]
-extern "C" {}
-
 #[link(name = "numa")]
-extern "C" {}
-
-#[link(name = "pthread")]
 extern "C" {}

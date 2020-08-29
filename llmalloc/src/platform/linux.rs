@@ -1,6 +1,6 @@
 //! Implementation of Linux specific calls.
 
-use core::{alloc::Layout, marker, ptr, sync::atomic};
+use core::{alloc::Layout, marker, mem, ptr, sync::atomic};
 
 use llmalloc_core::{self, PowerOf2};
 
@@ -57,7 +57,7 @@ impl Platform for LLPlatform {
     #[cold]
     #[inline(never)]
     fn current_node(&self) -> NumaNodeIndex {
-        let cpu = unsafe { sched_getcpu() };
+        let cpu = unsafe { libc::sched_getcpu() };
         let node = unsafe { numa_node_of_cpu(cpu) };
 
         assert!(cpu >= 0, "Expected CPU index, got {}", cpu);
@@ -79,23 +79,26 @@ impl<T> LLThreadLocal<T> {
     const UNDER_INITIALIZATION: i64 = -2;
 
     /// Creates an uninitialized instance.
-    pub(crate) const fn new(destructor: *const u8) -> Self {
+    ///
+    /// #   Safety
+    ///
+    /// -   Assumes that `destructor` points to an `unsafe extern "C" fn(*mut c_void)` function, or compatible.
+    pub(crate) const unsafe fn new(destructor: *const u8) -> Self {
         let key = atomic::AtomicI64::new(-1);
-        let destructor = destructor;
         let _marker = marker::PhantomData;
 
         LLThreadLocal { key, destructor, _marker }
     }
 
     #[inline(always)]
-    fn get_key(&self) -> u32 {
+    fn get_key(&self) -> libc::pthread_key_t {
         let key = self.key.load(atomic::Ordering::Relaxed);
-        if key >= 0 { key as u32} else { unsafe { self.initialize() } }
+        if key >= 0 { key as libc::pthread_key_t} else { unsafe { self.initialize() } }
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn initialize(&self) -> u32 {
+    unsafe fn initialize(&self) -> libc::pthread_key_t {
         let mut key = self.key.load(atomic::Ordering::Relaxed);
 
         if self.key.compare_and_swap(Self::UNINITIALIZED, Self::UNDER_INITIALIZATION, atomic::Ordering::Relaxed)
@@ -106,18 +109,21 @@ impl<T> LLThreadLocal<T> {
         }
 
         while key < 0 {
-            pthread_yield();
+            libc::sched_yield();
             key = self.key.load(atomic::Ordering::Relaxed);
         }
 
-        key as u32
+        key as libc::pthread_key_t
     }
 
     #[cold]
     unsafe fn create_key(&self) -> i64 {
-        let mut key = 0u32;
+        let mut key: libc::pthread_key_t = 0;
 
-        let result = pthread_key_create(&mut key as *mut _, self.destructor);
+        //  Safety:
+        //  -   fn pointers are just pointers.
+        let destructor = mem::transmute::<_, Destructor>(self.destructor);
+        let result = libc::pthread_key_create(&mut key as *mut _, Some(destructor));
         assert!(result == 0, "Could not create thread-local key: {}", result);
 
         key as i64
@@ -129,7 +135,7 @@ impl<T> ThreadLocal<T> for LLThreadLocal<T> {
         let key = self.key.load(atomic::Ordering::Relaxed);
 
         //  If key is not initialized, then a null pointer is returned.
-        unsafe { pthread_getspecific(key as u32) as *mut T }
+        unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) as *mut T }
     }
 
     #[cold]
@@ -137,12 +143,14 @@ impl<T> ThreadLocal<T> for LLThreadLocal<T> {
     fn set(&self, value: *mut T) {
         let key = self.get_key();
 
-        let result = unsafe { pthread_setspecific(key, value as *mut u8) };
+        let result = unsafe { libc::pthread_setspecific(key, value as *mut libc::c_void) };
         assert!(result == 0, "Could not set thread-local value for {}: {}", key, result);
     }
 }
 
 unsafe impl<T> Sync for LLThreadLocal<T> {}
+
+type Destructor = unsafe extern "C" fn(*mut libc::c_void);
 
 //  Selects the "best" node.
 //
@@ -169,10 +177,9 @@ fn select_node(original: NumaNodeIndex) -> NumaNodeIndex {
 fn mmap_huge(size: usize) -> Option<ptr::NonNull<u8>> {
     const MAP_HUGE_SHIFT: u8 = 26;
 
-    const MAP_HUGETLB: i32 = 0x40000;
-    const MAP_HUGE_1GB: i32 = 30 << MAP_HUGE_SHIFT;
+    const MAP_HUGE_1GB: libc::c_int = 30 << MAP_HUGE_SHIFT;
 
-    mmap_allocate(size, MAP_HUGETLB | MAP_HUGE_1GB)
+    mmap_allocate(size, libc::MAP_HUGETLB | MAP_HUGE_1GB)
         .and_then(|pointer| unsafe { mmap_check(pointer, size) })
 }
 
@@ -259,17 +266,9 @@ unsafe fn mmap_check(pointer: ptr::NonNull<u8>, size: usize) -> Option<ptr::NonN
 //
 //  Returns a pointer to `size` bytes of memory; does not guarantee any alignment.
 fn mmap_allocate(size: usize, extra_flags: i32) -> Option<ptr::NonNull<u8>> {
-    const FAILURE: *mut u8 = !0 as *mut u8;
-
-    const PROT_READ: i32 = 1;
-    const PROT_WRITE: i32 = 2;
-
-    const MAP_PRIVATE: i32 = 0x2;
-    const MAP_ANONYMOUS: i32 = 0x20;
-
     let length = size;
-    let prot = PROT_READ | PROT_WRITE;
-    let flags = MAP_PRIVATE | MAP_ANONYMOUS | extra_flags;
+    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | extra_flags;
 
     //  No specific address hint.
     let addr = ptr::null_mut();
@@ -280,9 +279,9 @@ fn mmap_allocate(size: usize, extra_flags: i32) -> Option<ptr::NonNull<u8>> {
 
     //  Safety:
     //  -   `addr`, `fd`, and `offset` are suitable for MAP_ANONYMOUS.
-    let result = unsafe { mmap(addr, length, prot, flags, fd, offset) };
+    let result = unsafe { libc::mmap(addr, length, prot, flags, fd, offset) };
 
-    let result = if result != FAILURE { result } else { ptr::null_mut() };
+    let result = if result != libc::MAP_FAILED { result as *mut u8 } else { ptr::null_mut() };
     ptr::NonNull::new(result)
 }
 
@@ -297,22 +296,8 @@ fn mmap_allocate(size: usize, extra_flags: i32) -> Option<ptr::NonNull<u8>> {
 //  -   Assumes that `addr` points to a `mmap`ed area of at least `size` bytes.
 //  -   Assumes that the range `[addr, addr + size)` is no longer in use.
 unsafe fn munmap_deallocate(addr: *mut u8, size: usize) {
-    let result = munmap(addr, size);
+    let result = libc::munmap(addr as *mut libc::c_void, size);
     assert!(result == 0, "Could not munmap {:x}, {}: {}", addr as usize, size, result);
-}
-
-#[link(name = "c")]
-extern "C" {
-    //  Returns the current index of the CPU on which the thread is executed.
-    //
-    //  The only possible error is ENOSYS, if the kernel does not implement getcpu.
-    fn sched_getcpu() -> i32;
-
-    //  Refer to: https://man7.org/linux/man-pages/man2/mmap.2.html
-    fn mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, offset: isize) -> *mut u8;
-
-    //  Refer to: https://man7.org/linux/man-pages/man2/mmap.2.html
-    fn munmap(addr: *mut u8, length: usize) -> i32;
 }
 
 #[link(name = "numa")]
@@ -324,30 +309,4 @@ extern "C" {
     //
     //  A node has a distance 10 to itself; factors should be multiples of 10, although 11 and 21 has been observed.
     fn numa_distance(left: i32, right: i32) -> i32;
-}
-
-#[link(name = "pthread")]
-extern "C" {
-    //  Initializes the value of the thread-local key.
-    //
-    //  Errors:
-    //  -   EAGAIN: if the system lacked the necessary resources.
-    //  -   ENOMEM: if insufficient memory exists to create the key.
-    fn pthread_key_create(key: *mut u32, destructor: *const u8) -> i32;
-
-    //  Gets the pointer to the thread-local value stored for key, or null.
-    fn pthread_getspecific(key: u32) -> *mut u8;
-
-    //  Sets the pointer to the thread-local value stored for key.
-    //
-    //  Errors:
-    //  -   ENOMEM: if insufficient memory exists to associate the value with the key.
-    //  -   EINVAL: if the key value is invalid.
-    fn pthread_setspecific(key: u32, value: *mut u8) -> i32;
-
-    //  Yields.
-    //
-    //  Errors:
-    //  -   None known.
-    fn pthread_yield() -> i32;
 }

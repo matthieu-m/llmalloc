@@ -122,10 +122,13 @@ static DOMAIN: DomainHandle = DomainHandle::new(LLPlatform::new());
 static SOCKETS: Sockets = Sockets::new();
 
 //  Thread-local.
-static THREAD_LOCAL: LLThreadLocal<u8> = LLThreadLocal::new(drop_handle as *const u8);
+//
+//  Safety:
+//  -   `drop_handle` points to an `unsafe extern "C" fn(*mut u8)`.
+static THREAD_LOCAL: LLThreadLocal<u8> = unsafe { LLThreadLocal::new(drop_handle as *const u8) };
 
 #[cold]
-unsafe fn drop_handle(handle: *mut u8) {
+unsafe extern "C" fn drop_handle(handle: *mut u8) {
     let thread = ThreadHandle::from_pointer(handle);
     let socket: SocketHandle = thread.socket();
     socket.release_thread_handle(thread);

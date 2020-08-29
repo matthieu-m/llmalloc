@@ -36,11 +36,5 @@ fn layout(size: usize, alignment: usize) -> Layout {
 criterion_main!(single_threaded);
 
 //  FIXME: use sys crates... properly configured for system libraries.
-#[link(name = "c")]
-extern "C" {}
-
 #[link(name = "numa")]
-extern "C" {}
-
-#[link(name = "pthread")]
 extern "C" {}

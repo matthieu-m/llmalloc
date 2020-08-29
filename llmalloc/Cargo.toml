@@ -8,6 +8,10 @@ edition = "2018"
 
 llmalloc-core = { path = "../llmalloc-core" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+
+libc = { version = "0.2.76", default-features = false }
+
 [dev-dependencies]
 
 criterion = "0.3"
