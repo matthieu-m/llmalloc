@@ -36,17 +36,20 @@ impl llmalloc_core::Platform for LLPlatform {
         assert!(layout.align() <= HUGE_PAGE_SIZE.value(),
             "Incorrect alignment: {} > {}", layout.align(), HUGE_PAGE_SIZE.value());
 
-        let candidate = mmap_simplified(layout.size());
+        let candidate = mmap_huge(layout.size())
+            .or_else(|| mmap_exact(layout.size()))
+            .or_else(|| mmap_over(layout.size()))
+            .map(|pointer| pointer.as_ptr())
+            .unwrap_or(ptr::null_mut());
 
-        assert!(candidate as usize % HUGE_PAGE_SIZE == 0,
-            "Incorrect alignment of allocation: {} % {} != 0", candidate as usize, HUGE_PAGE_SIZE.value());
+        debug_assert!(candidate as usize % HUGE_PAGE_SIZE == 0,
+            "Incorrect alignment of allocation: {:x} % {:x} != 0", candidate as usize, HUGE_PAGE_SIZE.value());
 
         candidate
     }
 
     unsafe fn deallocate(&self, pointer: *mut u8, layout: Layout) {
-        let result = munmap(pointer, layout.size());
-        assert!(result != 0, "{}", result);
+        munmap_deallocate(pointer, layout.size());
     }
 }
 
@@ -160,37 +163,142 @@ fn select_node(original: NumaNodeIndex) -> NumaNodeIndex {
     NumaNodeIndex::new(original as u32)
 }
 
-//  Wrapper around mmap.
+//  Attempts to allocate the required size in Huge Pages.
 //
-//  Returns a pointer to `size` bytes of memory aligned on a HUGE PAGE boundary, or null.
-unsafe fn mmap_simplified(size: usize) -> *mut u8 {
+//  If non-null, the result is aligned on `HUGE_PAGE_SIZE`.
+fn mmap_huge(size: usize) -> Option<ptr::NonNull<u8>> {
+    const MAP_HUGE_SHIFT: u8 = 26;
+
+    const MAP_HUGETLB: i32 = 0x40000;
+    const MAP_HUGE_1GB: i32 = 30 << MAP_HUGE_SHIFT;
+
+    mmap_allocate(size, MAP_HUGETLB | MAP_HUGE_1GB)
+        .and_then(|pointer| unsafe { mmap_check(pointer, size) })
+}
+
+//  Attempts to allocate the required size in Normal (or Large) Pages.
+//
+//  If non-null, the result is aligned on `HUGE_PAGE_SIZE`.
+fn mmap_exact(size: usize) -> Option<ptr::NonNull<u8>> {
+    mmap_allocate(size, 0)
+        .and_then(|pointer| unsafe { mmap_check(pointer, size) })
+}
+
+//  Attempts to allocate the required size in Normal (or Large) Pages.
+//
+//  Ensures the alignment is met by over-allocated then trimming front and back.
+fn mmap_over(size: usize) -> Option<ptr::NonNull<u8>> {
+    const ALIGNMENT: PowerOf2 = LLConfiguration::HUGE_PAGE_SIZE;
+
+    let over_size = size + ALIGNMENT.value();
+    let front_pointer = mmap_allocate(over_size, 0)?;
+
+    let back_size = (front_pointer.as_ptr() as usize) % ALIGNMENT;
+    let front_size = ALIGNMENT.value() - back_size;
+
+    debug_assert!(front_size <= ALIGNMENT.value(), "{} > {}", front_size, ALIGNMENT.value());
+    debug_assert!(back_size < ALIGNMENT.value(), "{} >= {}", back_size, ALIGNMENT.value());
+    debug_assert!(front_size + size + back_size == over_size,
+        "{} + {} + {} != {}", front_size, size, back_size, over_size);
+
+    //  Safety:
+    //  -   `front_size` is less than `over_size`, hence the result is within the allocated block.
+    let aligned_pointer = unsafe { front_pointer.as_ptr().add(front_size) };
+
+    debug_assert!(aligned_pointer as usize % ALIGNMENT == 0,
+        "{:x} not {:x}-aligned!", aligned_pointer as usize, ALIGNMENT.value());
+
+    //  Safety:
+    //  -   `front_size + size` is less than `over_size`, hence the result is within the allocated block,
+    //      or pointing to its end.
+    let back_pointer = unsafe { aligned_pointer.add(size) };
+
+    if front_size > 0 {
+        //  Safety:
+        //  -   `front_pointer` points to a `mmap`ed area of at least `front_size` bytes.
+        //  -   `[front_pointer, front_pointer + front_size)` is no longer in use.
+        unsafe { munmap_deallocate(front_pointer.as_ptr(), front_size) };
+    }
+
+    if back_size > 0 {
+        //  Safety:
+        //  -   `back_pointer` points to a `mmap`ed area of at least `back_size` bytes.
+        //  -   `[back_pointer, back_pointer + back_size)` is no longer in use.
+        unsafe { munmap_deallocate(back_pointer, back_size) };
+    }
+
+    //  Safety:
+    //  -   `aligned_pointer` is not null.
+    Some(unsafe { ptr::NonNull::new_unchecked(aligned_pointer) })
+}
+
+//  `mmap` alignment checker.
+//
+//  Returns a non-null pointer if suitably aligned, and None otherwise.
+//  If none is returned, the memory has been unmapped.
+//
+//  #   Safety
+//
+//  -   Assumes that `pointer` points to a `mmap`ed area of at least `size` bytes.
+//  -   Assumes that `pointer` is no longer in use, unless returned.
+unsafe fn mmap_check(pointer: ptr::NonNull<u8>, size: usize) -> Option<ptr::NonNull<u8>> {
+    const ALIGNMENT: PowerOf2 = LLConfiguration::HUGE_PAGE_SIZE;
+
+    if pointer.as_ptr() as usize % ALIGNMENT == 0 {
+        Some(pointer)
+    } else {
+        //  Safety:
+        //  -   `pointer` points to a `mmap`ed area of at least `size` bytes.
+        //  -   `[pointer, pointer + size)` is no longer in use.
+        munmap_deallocate(pointer.as_ptr(), size);
+        None
+    }
+}
+
+//  Wrapper around `mmap`.
+//
+//  Returns a pointer to `size` bytes of memory; does not guarantee any alignment.
+fn mmap_allocate(size: usize, extra_flags: i32) -> Option<ptr::NonNull<u8>> {
     const FAILURE: *mut u8 = !0 as *mut u8;
 
     const PROT_READ: i32 = 1;
     const PROT_WRITE: i32 = 2;
 
+    const MAP_PRIVATE: i32 = 0x2;
     const MAP_ANONYMOUS: i32 = 0x20;
-    const MAP_HUGETLB: i32 = 0x40000;
-    const MAP_HUGE_1GB: i32 = 30 << MAP_HUGE_SHIFT;
 
-    const MAP_HUGE_SHIFT: u8 = 26;
-
-    let addr = ptr::null_mut();
     let length = size;
     let prot = PROT_READ | PROT_WRITE;
-    let flags = MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB;
+    let flags = MAP_PRIVATE | MAP_ANONYMOUS | extra_flags;
+
+    //  No specific address hint.
+    let addr = ptr::null_mut();
     //  When used in conjunction with MAP_ANONYMOUS, fd is mandated to be -1 on some implementations.
     let fd = -1;
     //  When used in conjunction with MAP_ANONYMOUS, offset is mandated to be 0 on some implementations.
     let offset = 0;
 
-    let result = mmap(addr, length, prot, flags, fd, offset);
+    //  Safety:
+    //  -   `addr`, `fd`, and `offset` are suitable for MAP_ANONYMOUS.
+    let result = unsafe { mmap(addr, length, prot, flags, fd, offset) };
 
-    if result != FAILURE {
-        result
-    } else {
-        ptr::null_mut()
-    }
+    let result = if result != FAILURE { result } else { ptr::null_mut() };
+    ptr::NonNull::new(result)
+}
+
+//  Wrapper around `munmap`.
+//
+//  #   Panics
+//
+//  If `munmap` returns a non-0 result.
+//
+//  #   Safety
+//
+//  -   Assumes that `addr` points to a `mmap`ed area of at least `size` bytes.
+//  -   Assumes that the range `[addr, addr + size)` is no longer in use.
+unsafe fn munmap_deallocate(addr: *mut u8, size: usize) {
+    let result = munmap(addr, size);
+    assert!(result == 0, "Could not munmap {:x}, {}: {}", addr as usize, size, result);
 }
 
 #[link(name = "c")]

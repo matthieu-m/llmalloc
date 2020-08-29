@@ -55,11 +55,10 @@ impl ClassSize {
     /// Returns the number of class sizes for a given Normal page size.
     pub const fn number_classes(page_size: PowerOf2) -> usize {
         //  On a 64 bits architecture:
-        //  -   32 -> 4
-        //  -   64 -> 8
-        //  -   128 -> 12
+        //  -   128 -> 4
+        //  -   256 -> 8
         //  ...
-        let span = MIN_ALLOCATION_SIZE.leading_zeros() - page_size.value().leading_zeros();
+        let span = MIN_ALLOCATION_SIZE.leading_zeros() - page_size.value().leading_zeros() - 1;
         (span * 4) as usize
     }
 
@@ -231,14 +230,24 @@ fn class_size_number_classes() {
         let page_size = PowerOf2::new(page_size).expect("Power of 2");
         ClassSize::number_classes(page_size)
     }
+                                                                //  On a 64-bits host:
+    assert_eq!( 0, number_classes(  2 * MIN_ALLOCATION_SIZE));  //   64B page
+    assert_eq!( 4, number_classes(  4 * MIN_ALLOCATION_SIZE));  //  128B page
+    assert_eq!( 8, number_classes(  8 * MIN_ALLOCATION_SIZE));  //  256B page
+    assert_eq!(12, number_classes( 16 * MIN_ALLOCATION_SIZE));  //  512B page
+    assert_eq!(16, number_classes( 32 * MIN_ALLOCATION_SIZE));  //    1KB page
+    assert_eq!(20, number_classes( 64 * MIN_ALLOCATION_SIZE));  //    2KB page
+    assert_eq!(24, number_classes(128 * MIN_ALLOCATION_SIZE));  //    4KB page
+    assert_eq!(28, number_classes(256 * MIN_ALLOCATION_SIZE));  //    8KB page
+    assert_eq!(32, number_classes(512 * MIN_ALLOCATION_SIZE));  //   16KB page
 
-    assert_eq!(0, number_classes(MIN_ALLOCATION_SIZE));
-    assert_eq!(4, number_classes(2 * MIN_ALLOCATION_SIZE));
-    assert_eq!(8, number_classes(4 * MIN_ALLOCATION_SIZE));
-    assert_eq!(12, number_classes(8 * MIN_ALLOCATION_SIZE));
-    assert_eq!(16, number_classes(16 * MIN_ALLOCATION_SIZE));
-    assert_eq!(20, number_classes(32 * MIN_ALLOCATION_SIZE));
-    assert_eq!(24, number_classes(64 * MIN_ALLOCATION_SIZE));
+    assert_eq!(36, number_classes(  1 * 1024 * MIN_ALLOCATION_SIZE));   //   32KB page
+    assert_eq!(40, number_classes(  2 * 1024 * MIN_ALLOCATION_SIZE));   //   64KB page
+    assert_eq!(44, number_classes(  4 * 1024 * MIN_ALLOCATION_SIZE));   //  128KB page
+    assert_eq!(48, number_classes(  8 * 1024 * MIN_ALLOCATION_SIZE));   //  256KB page
+    assert_eq!(52, number_classes( 16 * 1024 * MIN_ALLOCATION_SIZE));   //  512KB page
+    assert_eq!(56, number_classes( 32 * 1024 * MIN_ALLOCATION_SIZE));   //    1MB page
+    assert_eq!(60, number_classes( 64 * 1024 * MIN_ALLOCATION_SIZE));   //    2MB page
 }
 
 #[cfg(target_pointer_width = "32")]
