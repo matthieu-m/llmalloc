@@ -66,7 +66,7 @@ impl ClassSize {
     pub const fn new(value: usize) -> Self { Self(value) }
 
     /// Creates an instance based on the requested size of the allocation.
-    pub fn from_size(size: num::NonZeroUsize) -> Self {
+    pub const fn from_size(size: num::NonZeroUsize) -> Self {
         //  On a 64 bits architecture:
         //  -    1-16 -> 0
         //
