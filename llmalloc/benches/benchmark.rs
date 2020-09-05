@@ -33,8 +33,8 @@ fn single_threaded_single_allocation_allocation(c: &mut Criterion) {
 fn single_threaded_single_allocation_deallocation(c: &mut Criterion) {
     fn bencher<T: Vector>(name: &'static str, c: &mut Criterion) {
         c.bench_function(name, |b| b.iter_batched_ref(
-            || black_box(T::with_capacity(32)),
-            |v| std::mem::drop(v),
+            || black_box(Some(T::with_capacity(32))),
+            |v| v.take(),
             BatchSize::NumIterations(1)
         ));
     }
