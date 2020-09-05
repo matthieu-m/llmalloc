@@ -72,12 +72,12 @@ impl CellLocal {
         ptr::NonNull::new_unchecked(at)
     }
 
-    /// In-place reinterpret a `CellForeign` as a `CellLocal`.
+    /// In-place reinterpret a `CellAtomicForeign` as a `CellLocal`.
     ///
     /// #   Safety
     ///
     /// -   Assumes that access to the cell, and all tail cells, is exclusive.
-    pub(crate) unsafe fn from(foreign: ptr::NonNull<CellForeign>) -> ptr::NonNull<CellLocal> {
+    pub(crate) unsafe fn from_atomic(foreign: ptr::NonNull<CellAtomicForeign>) -> ptr::NonNull<CellLocal> {
         //  Safety:
         //  -   The layout are checked to be compatible below.
         let local = foreign.cast();
@@ -87,15 +87,34 @@ impl CellLocal {
         local
     }
 
-    //  Returns whether the layout of CellForeign and CellLocal are compatible.
+    /// In-place reinterpret a `CellForeign` as a `CellLocal`.
+    ///
+    /// #   Safety
+    ///
+    /// -   Assumes that access to the cell, and all tail cells, is exclusive.
+    pub(crate) unsafe fn from_foreign(foreign: ptr::NonNull<CellForeign>) -> ptr::NonNull<CellLocal> {
+        //  Safety:
+        //  -   The layout are checked to be compatible below.
+        let atomic: ptr::NonNull<CellAtomicForeign> = foreign.cast();
+
+        //  Safety:
+        //  -   The layout are checked to be compatible below.
+        let local = atomic.cast();
+
+        debug_assert!(Self::are_layout_compatible(atomic, local));
+
+        local
+    }
+
+    //  Returns whether the layout of CellAtomicForeign and CellLocal are compatible.
     //
     //  The layout are compatible if:
-    //  -   CellLocalPtr and CellForeignPtr are both plain pointers, size-wise.
-    //  -   CellLocal::next and CellForeign::next are placed at the same offset.
-    fn are_layout_compatible(foreign: ptr::NonNull<CellForeign>, local: ptr::NonNull<CellLocal>) -> bool {
+    //  -   CellLocalPtr and CellAtomicForeignPtr are both plain pointers, size-wise.
+    //  -   CellLocal::next and CellAtomicForeign::next are placed at the same offset.
+    fn are_layout_compatible(foreign: ptr::NonNull<CellAtomicForeign>, local: ptr::NonNull<CellLocal>) -> bool {
         const PTR_SIZE: usize = mem::size_of::<*const u8>();
 
-        if mem::size_of::<CellLocalPtr>() != PTR_SIZE || mem::size_of::<CellForeignPtr>() != PTR_SIZE {
+        if mem::size_of::<CellLocalPtr>() != PTR_SIZE || mem::size_of::<CellAtomicForeignPtr>() != PTR_SIZE {
             return false;
         }
 
@@ -167,8 +186,8 @@ impl CellLocalPtr {
     /// #   Safety
     ///
     /// -   Assumes that access to the memory location, and any tail location, is exclusive.
-    pub(crate) unsafe fn refill(&self, cell: ptr::NonNull<CellForeign>) {
-        self.set(CellLocal::from(cell).as_ptr())
+    pub(crate) unsafe fn refill(&self, cell: ptr::NonNull<CellLocal>) {
+        self.set(cell.as_ptr())
     }
 
     /// Extends the tail-list pointed to by prepending `list`.
@@ -185,14 +204,14 @@ impl CellLocalPtr {
         let (head, tail) = list.steal();
 
         //  Link the tail.
-        let tail = CellLocal::from(tail);
+        let tail = CellLocal::from_foreign(tail);
 
         //  Safety:
         //  -   Boundded lifetime.
         tail.as_ref().next.set(self.get());
 
         //  Set the head.
-        let head = CellLocal::from(head);
+        let head = CellLocal::from_foreign(head);
         self.set(head.as_ptr());
     }
 
@@ -211,21 +230,22 @@ impl CellLocalPtr {
 
 /// CellForeign.
 ///
-/// A CellForeign points to memory not local to the current ThreadLocal.
+/// A CellForeign points to memory not local to the current ThreadLocal, but is still only manipulated by the current
+/// thread.
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct CellForeign {
     //  Pointer to the next cell, linked-list style, if any.
-    next: CellForeignPtr,
-    //  Length of linked-list starting at the next cell in CellForeignPtr.
+    next: CellPtr<CellForeign>,
+    //  Length of linked-list starting at the next cell in CellAtomicForeignPtr.
     //  Only accurate for the head.
-    length: AtomicLength,
+    length: cell::Cell<usize>,
     //  Tail of the list, only used by CellForeignList.
     tail: CellPtr<CellForeign>,
 }
 
 impl CellForeign {
-    /// In-place constructs a `CellForeign`.
+    /// In-place constructs a `CellAtomicForeign`.
     ///
     /// #   Safety
     ///
@@ -233,88 +253,21 @@ impl CellForeign {
     /// -   Assumes that there is sufficient memory available.
     /// -   Assumes that the pointer is correctly aligned.
     #[allow(clippy::cast_ptr_alignment)]
-    pub(crate) unsafe fn initialize(at: *mut u8) -> ptr::NonNull<CellForeign> {
-        debug_assert!(utils::is_sufficiently_aligned_for(at, PowerOf2::align_of::<CellForeign>()));
+    pub(crate) unsafe fn initialize(at: *mut u8) -> ptr::NonNull<Self> {
+        debug_assert!(utils::is_sufficiently_aligned_for(at, PowerOf2::align_of::<Self>()));
 
         //  Safety:
         //  -   `at` is assumed to be sufficiently aligned.
-        let at = at as *mut CellForeign;
+        let at = at as *mut Self;
 
         //  Safety:
         //  -   Access to the memory location is exclusive.
         //  -   `at` is assumed to be sufficiently sized.
-        ptr::write(at, CellForeign::default());
+        ptr::write(at, Self::default());
 
         //  Safety:
         //  -   Not null.
         ptr::NonNull::new_unchecked(at)
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct CellForeignStack(AtomicPtr<CellForeign>);
-
-impl CellForeignStack {
-    /// Pops the top of the stack, if any.
-    pub(crate) fn pop(&self) -> Option<ptr::NonNull<CellForeign>> {
-        let mut current = self.0.load();
-
-        loop {
-            if current.is_null() {
-                return None;
-            }
-
-            //  If current was null, then the compare-exchange would have succeeded.
-            debug_assert!(!current.is_null());
-
-            //  Safety:
-            //  -   `current` is not null.
-            let head = unsafe { &*current };
-
-            let next = head.next.0.load();
-
-            match self.0.compare_exchange(current, next) {
-                //  Safety:
-                //  -   `current` is not null.
-                Ok(_) => return Some(unsafe { ptr::NonNull::new_unchecked(current) }),
-                Err(new_current) => current = new_current,
-            }
-        }
-    }
-
-    /// Pushes onto the stack.
-    pub(crate) fn push(&self, cell: ptr::NonNull<CellForeign>) {
-        let mut current = self.0.load();
-
-        loop {
-            if current.is_null() {
-                match self.0.compare_exchange(current, cell.as_ptr()) {
-                    Ok(_) => return,
-                    Err(new_current) => current = new_current,
-                }
-            }
-
-            //  If current was null, then the compare-exchange would have succeeded.
-            debug_assert!(!current.is_null());
-
-            //  Safety:
-            //  -   `current` is not null.
-            let next = unsafe { &*current };
-
-            let new_length = next.length.load() + 1;
-
-            //  Safety:
-            //  -   Short lifetime
-            unsafe {
-                cell.as_ref().next.0.store(current);
-                cell.as_ref().length.store(new_length);
-            }
-
-            match self.0.compare_exchange(current, cell.as_ptr()) {
-                Ok(_) => return,
-                Err(new_current) => current = new_current,
-            }
-        }
     }
 }
 
@@ -335,7 +288,7 @@ impl CellForeignList {
         } else {
             //  Safety:
             //  -   The pointer is valid.
-            unsafe { (*head).length.load() + 1 }
+            unsafe { (*head).length.get() + 1 }
         }
     }
 
@@ -369,7 +322,7 @@ impl CellForeignList {
             //  Safety:
             //  -   Bounded lifetime.
             unsafe {
-                cell.as_ref().length.store(0);
+                cell.as_ref().length.set(0);
                 cell.as_ref().tail.set(ptr);
             }
 
@@ -382,7 +335,7 @@ impl CellForeignList {
 
         //  Safety:
         //  -   The pointer is valid.
-        let length = unsafe { (*head).length.load() };
+        let length = unsafe { (*head).length.get() };
         let tail = unsafe { (*head).tail.get() };
 
         {
@@ -390,8 +343,8 @@ impl CellForeignList {
             //  -   Bounded lifetime.
             let cell = unsafe { cell.as_ref() };
 
-            cell.next.0.store(head);
-            cell.length.store(length + 1);
+            cell.next.0.set(head);
+            cell.length.set(length + 1);
             cell.tail.set(tail);
         }
 
@@ -428,11 +381,82 @@ impl CellForeignList {
     }
 }
 
-/// CellForeignPtr.
+/// CellAtomicForeign.
+///
+/// A CellAtomicForeign points to memory not local to the current ThreadLocal.
+#[repr(C)]
 #[derive(Default)]
-pub(crate) struct CellForeignPtr(AtomicPtr<CellForeign>);
+pub(crate) struct CellAtomicForeign {
+    //  Pointer to the next cell, linked-list style, if any.
+    next: CellAtomicForeignPtr,
+    //  Length of linked-list starting at the next cell in CellAtomicForeignPtr.
+    //  Only accurate for the head.
+    length: AtomicLength,
+}
 
-impl CellForeignPtr {
+impl CellAtomicForeign {
+    /// In-place reinterpret a `CellForeign` as a `CellAtomicForeign`.
+    ///
+    /// #   Safety
+    ///
+    /// -   Assumes that access to the cell, and all tail cells, is exclusive.
+    /// -   Assumes that a Release atomic fence was called after the last write to the `CellForeign` list.
+    pub(crate) unsafe fn from(foreign: ptr::NonNull<CellForeign>) -> ptr::NonNull<CellAtomicForeign> {
+        //  Safety:
+        //  -   The layout are checked to be compatible below.
+        let atomic = foreign.cast();
+
+        debug_assert!(Self::are_layout_compatible(foreign, atomic));
+
+        atomic
+    }
+
+    //  Returns whether the layout of CellForeign and CellAtomicForeign are compatible.
+    //
+    //  The layout are compatible if:
+    //  -   CellPtr<CellForeign> and CellAtomicForeignPtr are both plain pointers, size-wise.
+    //  -   Cell<usize> and AtomicLength are both plain usize, size-wise.
+    //  -   CellAtomicForeign::next and CellForeign::next are placed at the same offset.
+    //  -   CellAtomicForeign::length and CellForeign::length are placed at the same offset.
+    fn are_layout_compatible(foreign: ptr::NonNull<CellForeign>, atomic: ptr::NonNull<CellAtomicForeign>) -> bool {
+        const PTR_SIZE: usize = mem::size_of::<*const u8>();
+        const USIZE_SIZE: usize = mem::size_of::<usize>();
+
+        if mem::size_of::<CellPtr<CellForeign>>() != PTR_SIZE || mem::size_of::<CellAtomicForeignPtr>() != PTR_SIZE {
+            return false;
+        }
+
+        if mem::size_of::<cell::Cell<usize>>() != USIZE_SIZE || mem::size_of::<AtomicLength>() != USIZE_SIZE {
+            return false;
+        }
+
+        let (foreign_next_offset, foreign_length_offset) = {
+            let address = foreign.as_ptr() as usize;
+            //  Safety:
+            //  -   Bounded lifetime.
+            let next_address = unsafe { &foreign.as_ref().next as *const _ as usize };
+            let length_address = unsafe { &foreign.as_ref().length as *const _ as usize };
+            (next_address - address, length_address - address)
+        };
+
+        let (atomic_next_offset, atomic_length_offset) = {
+            let address = atomic.as_ptr() as usize;
+            //  Safety:
+            //  -   Bounded lifetime.
+            let next_address = unsafe { &atomic.as_ref().next as *const _ as usize };
+            let length_address = unsafe { &atomic.as_ref().length as *const _ as usize };
+            (next_address - address, length_address - address)
+        };
+
+        foreign_next_offset == atomic_next_offset && foreign_length_offset == atomic_length_offset
+    }
+}
+
+/// CellAtomicForeignPtr.
+#[derive(Default)]
+pub(crate) struct CellAtomicForeignPtr(AtomicPtr<CellAtomicForeign>);
+
+impl CellAtomicForeignPtr {
     /// Returns the length of the tail list.
     pub(crate) fn len(&self) -> usize {
         let head = self.0.load();
@@ -447,7 +471,7 @@ impl CellForeignPtr {
     }
 
     /// Steals the content of the list.
-    pub(crate) fn steal(&self) -> *mut CellForeign { self.0.exchange(ptr::null_mut()) }
+    pub(crate) fn steal(&self) -> *mut CellAtomicForeign { self.0.exchange(ptr::null_mut()) }
 
     /// Extends the tail-list pointed to by prepending `list`, atomically.
     ///
@@ -464,6 +488,13 @@ impl CellForeignPtr {
         //  Safety:
         //  -   The list is assumed not to be empty.
         let (head, tail) = unsafe { list.steal() };
+
+        atomic::fence(atomic::Ordering::Release);
+
+        //  Safety:
+        //  -   Access to the list cells is exclusive.
+        //  -   A Release atomic fence was called after the last write to the `CellForeign` list.
+        let (head, tail) = unsafe { (CellAtomicForeign::from(head), CellAtomicForeign::from(tail)) };
 
         let mut current = self.0.load();
 
@@ -501,10 +532,73 @@ impl CellForeignPtr {
             }
         }
     }
+}
 
-    /// Checks whether the pointer is null, or not.
-    #[cfg(test)]
-    fn is_null(&self) -> bool { self.0.load().is_null() }
+#[derive(Default)]
+pub(crate) struct CellAtomicForeignStack(AtomicPtr<CellAtomicForeign>);
+
+impl CellAtomicForeignStack {
+    /// Pops the top of the stack, if any.
+    pub(crate) fn pop(&self) -> Option<ptr::NonNull<CellAtomicForeign>> {
+        let mut current = self.0.load();
+
+        loop {
+            if current.is_null() {
+                return None;
+            }
+
+            //  If current was null, then the compare-exchange would have succeeded.
+            debug_assert!(!current.is_null());
+
+            //  Safety:
+            //  -   `current` is not null.
+            let head = unsafe { &*current };
+
+            let next = head.next.0.load();
+
+            match self.0.compare_exchange(current, next) {
+                //  Safety:
+                //  -   `current` is not null.
+                Ok(_) => return Some(unsafe { ptr::NonNull::new_unchecked(current) }),
+                Err(new_current) => current = new_current,
+            }
+        }
+    }
+
+    /// Pushes onto the stack.
+    pub(crate) fn push(&self, cell: ptr::NonNull<CellAtomicForeign>) {
+        let mut current = self.0.load();
+
+        loop {
+            if current.is_null() {
+                match self.0.compare_exchange(current, cell.as_ptr()) {
+                    Ok(_) => return,
+                    Err(new_current) => current = new_current,
+                }
+            }
+
+            //  If current was null, then the compare-exchange would have succeeded.
+            debug_assert!(!current.is_null());
+
+            //  Safety:
+            //  -   `current` is not null.
+            let next = unsafe { &*current };
+
+            let new_length = next.length.load() + 1;
+
+            //  Safety:
+            //  -   Short lifetime
+            unsafe {
+                cell.as_ref().next.0.store(current);
+                cell.as_ref().length.store(new_length);
+            }
+
+            match self.0.compare_exchange(current, cell.as_ptr()) {
+                Ok(_) => return,
+                Err(new_current) => current = new_current,
+            }
+        }
+    }
 }
 
 //
@@ -639,13 +733,13 @@ fn cell_local_from() {
     //  Safety:
     //  -   Bounded lifetime.
     unsafe {
-        head.as_ref().next.0.store(tail.as_ptr());
-        head.as_ref().length.store(1);
+        head.as_ref().next.0.set(tail.as_ptr());
+        head.as_ref().length.set(1);
     }
 
     //  Safety:
     //  -   Access to the cells is exclusive.
-    let cell = unsafe { CellLocal::from(head) };
+    let cell = unsafe { CellLocal::from_foreign(head) };
 
     //  Safety:
     //  -  Bounded lifetime.
@@ -710,14 +804,13 @@ fn cell_local_ptr_pop_push() {
 
 #[test]
 fn cell_local_ptr_refill() {
-    let array = AlignedArray::<CellForeign>::default();
+    let array = AlignedArray::<CellLocal>::default();
     let (head, tail) = (array.get(1), array.get(2));
 
     //  Safety:
     //  -   Bounded lifetime.
     unsafe {
-        head.as_ref().next.0.store(tail.as_ptr());
-        head.as_ref().length.store(1);
+        head.as_ref().next.0.set(tail.as_ptr());
     }
 
     let ptr = CellLocalPtr::default();
@@ -786,17 +879,17 @@ fn cell_foreign_initialize() {
     //  -   Initialized!
     let cell = unsafe { cell.assume_init() };
 
-    assert!(cell.next.is_null());
-    assert_eq!(0, cell.length.load());
+    assert!(cell.next.get().is_null());
+    assert_eq!(0, cell.length.get());
     assert!(cell.tail.get().is_null());
 }
 
 #[test]
 fn cell_foreign_stack_pop_push() {
-    let array = AlignedArray::<CellForeign>::default();
+    let array = AlignedArray::<CellAtomicForeign>::default();
     let (a, b) = (array.get(0), array.get(1));
 
-    let stack = CellForeignStack::default();
+    let stack = CellAtomicForeignStack::default();
 
     assert_eq!(None, stack.pop());
 
@@ -880,7 +973,7 @@ fn cell_foreign_ptr_extend_steal() {
     list.push(b);
     list.push(a);
 
-    let foreign = CellForeignPtr::default();
+    let foreign = CellAtomicForeignPtr::default();
     assert_eq!(0, foreign.len());
 
     foreign.extend(&list);
@@ -898,7 +991,7 @@ fn cell_foreign_ptr_extend_steal() {
 
     //  Double-check the list!
     let local = CellLocalPtr::default();
-    unsafe { local.refill(ptr::NonNull::new(head).unwrap()) };
+    unsafe { local.refill(CellLocal::from_atomic(ptr::NonNull::new(head).unwrap())) };
 
     assert_eq!(Some(x.cast()), local.pop());
     assert_eq!(Some(y.cast()), local.pop());

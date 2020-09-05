@@ -16,7 +16,7 @@ use core::{alloc::Layout, cmp, marker, mem, num, ptr, slice, sync::atomic};
 
 use crate::{Category, ClassSize, Configuration, Platform, PowerOf2, Properties};
 use crate::internals::{
-    cells::{CellForeign, CellForeignList, CellForeignStack},
+    cells::{CellAtomicForeign, CellForeign, CellForeignList, CellAtomicForeignStack},
     huge_allocator::HugeAllocator,
     huge_page::HugePage,
     large_page::{LargePage, LargePageStack},
@@ -694,7 +694,7 @@ struct ThreadLocalsManager<C> {
     //  Owner.
     owner: *mut (),
     //  Stack of available thread-locals.
-    stack: CellForeignStack,
+    stack: CellAtomicForeignStack,
     //  Current watermark for fresh allocations into the buffer area.
     watermark: atomic::AtomicPtr<u8>,
     //  End of buffer area.
@@ -726,7 +726,7 @@ impl<C> ThreadLocalsManager<C>
         let watermark = unsafe { end.sub(nb_thread_locals * Self::THREAD_LOCAL_SIZE) };
         let watermark = atomic::AtomicPtr::new(watermark);
 
-        let stack = CellForeignStack::default();
+        let stack = CellAtomicForeignStack::default();
 
         Self { owner, stack, watermark, end, _configuration, }
     }
@@ -801,7 +801,7 @@ impl<C> ThreadLocalsManager<C>
     //  Internal; Pushes a ThreadLocal onto the stack.
     fn push(&self, thread_local: ptr::NonNull<ThreadLocal<C>>) {
         let cell = thread_local.cast();
-        unsafe { ptr::write(cell.as_ptr(), CellForeign::default()) };
+        unsafe { ptr::write(cell.as_ptr(), CellAtomicForeign::default()) };
 
         self.stack.push(cell);
     }
@@ -811,7 +811,7 @@ impl<C> Default for ThreadLocalsManager<C> {
     fn default() -> Self {
         Self {
             owner: ptr::null_mut(),
-            stack: CellForeignStack::default(),
+            stack: CellAtomicForeignStack::default(),
             watermark: atomic::AtomicPtr::new(ptr::null_mut()),
             end: ptr::null_mut(),
             _configuration: marker::PhantomData,

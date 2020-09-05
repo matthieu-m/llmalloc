@@ -7,7 +7,7 @@
 use core::{cell, cmp, mem, ptr, sync::atomic};
 
 use crate::{ClassSize, Configuration, PowerOf2};
-use crate::internals::cells::{CellLocal, CellLocalPtr, CellForeign, CellForeignList, CellForeignPtr};
+use crate::internals::cells::{CellLocal, CellLocalPtr, CellForeignList, CellAtomicForeignPtr};
 use crate::utils;
 
 /// The header of a Large Page, for normal allocations.
@@ -386,7 +386,7 @@ impl Local {
     /// #   Safety
     ///
     /// -   Assumes that access to the cell, and all linked cells, is exclusive.
-    unsafe fn refill(&self, list: ptr::NonNull<CellForeign>) {
+    unsafe fn refill(&self, list: ptr::NonNull<CellLocal>) {
         //  Safety:
         //  -   It is assumed that access to the cell, and all linked cells, is exclusive.
         self.next.refill(list);
@@ -399,7 +399,7 @@ struct Foreign {
     //  Pointer to the next LargePage.
     next: LargePagePtr,
     //  List of cells returned by other threads.
-    freed: CellForeignPtr,
+    freed: CellAtomicForeignPtr,
     //  The adrift marker.
     //
     //  A page that is too full is marked as "adrift", and cast away. As cells are freed -- as denoted by next.length
@@ -415,7 +415,7 @@ impl Foreign {
         debug_assert!(catch_threshold >= 1);
 
         let next = LargePagePtr::default();
-        let freed = CellForeignPtr::default();
+        let freed = CellAtomicForeignPtr::default();
         let adrift = Adrift::default();
 
         Self { next, freed, adrift, catch_threshold, }
@@ -485,7 +485,7 @@ impl Foreign {
 
         //  Safety:
         //  -   Access to `list` is exclusive.
-        local.refill(list);
+        local.refill(CellLocal::from_atomic(list));
 
         local.allocate()
     }
@@ -575,6 +575,7 @@ mod tests {
 use core::{mem, ops, slice};
 
 use super::*;
+use crate::internals::cells::{CellForeign, CellAtomicForeign};
 
 const CELL_SIZE: usize = 32;
 
@@ -626,10 +627,10 @@ impl CellStore {
     ///
     /// -   `local` should have been created from this instance.
     /// -   The cells should not _also_ be available through `local.next`.
-    unsafe fn create_foreign_stack(&self, local: &Local, cells: ops::Range<usize>) -> ptr::NonNull<CellForeign> {
+    unsafe fn create_foreign_stack(&self, local: &Local, cells: ops::Range<usize>) -> ptr::NonNull<CellAtomicForeign> {
         let list = self.create_foreign_list(local, cells);
 
-        let cell = CellForeignPtr::default();
+        let cell = CellAtomicForeignPtr::default();
         cell.extend(&list);
 
         ptr::NonNull::new(cell.steal()).unwrap()
@@ -798,7 +799,7 @@ fn local_refill() {
 
     let foreign = unsafe { cell_store.create_foreign_stack(&local, 3..7) };
 
-    unsafe { local.refill(foreign) };
+    unsafe { local.refill(CellLocal::from_atomic(foreign)) };
 
     for i in 3..7 {
         assert_eq!(cell_store.get(4 * i) as usize, local.allocate() as usize);
