@@ -1162,7 +1162,7 @@ fn create_page_tokens(tokens: RawPageTokens) -> PageTokens {
     page_tokens
 }
 
-//  FIXME: use #[track_caller] when available on stable.
+#[track_caller]
 fn check_tokens(tokens: RawPageTokens, expected: RawPageTokens) {
     assert_eq!(tokens.len(), expected.len());
 
