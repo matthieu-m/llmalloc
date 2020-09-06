@@ -1,4 +1,4 @@
-use std::{alloc::Layout, collections::VecDeque};
+use std::{alloc::Layout, collections::VecDeque, time};
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
@@ -31,19 +31,39 @@ fn single_threaded_single_allocation_allocation(c: &mut Criterion) {
 //
 //  This is somewhat of a best-case scenario for thread-local caching and measures the lower-bound of allocator latency.
 fn single_threaded_single_allocation_deallocation(c: &mut Criterion) {
+    //  For reasons unfathomable, this benchmark is _completely_ wrecked.
+    //
+    //  It consistently returns a measurement of about 5 _micro_ seconds, when allocate+deallocate is under 100ns.
+    //
+    //  Attempts:
+    //  -   Valgrind clean, so no obvious memory error.
+    //  -   Measurements using lfence + rdtsc (cycles, instead of nanos), lead to the exact same issue _and
+    //      measurements_.
+    //      -   The assembly only shows an (indirect) call to `LLAllocator::deallocate` within the timed section.
+    //  -   Printing 1% and 99% percentiles show a range from 5us to 13us !?!?
     fn bencher<T: Vector>(name: &'static str, c: &mut Criterion) {
-        c.bench_function(name, |b| b.iter_batched_ref(
-            || black_box(Some(T::with_capacity(32))),
-            |v| v.take(),
-            BatchSize::NumIterations(1)
-        ));
+        c.bench_function(name, |b| b.iter_custom(|iterations| {
+            let mut duration = time::Duration::default();
+
+            for _ in 0..iterations {
+                let v = black_box(T::with_capacity(32));
+
+                let start = time::Instant::now();
+
+                std::mem::drop(v);
+
+                duration += start.elapsed();
+            }
+
+            duration
+        }));
     }
 
     LL_ALLOCATOR.warm_up().expect("Warmed up");
 
-    bencher::<SysVec>("ST SA Deallocation - sys", c);
+    bencher::<SysVec>("ST SA Deallocation - sys (unexplained)", c);
 
-    bencher::<LLVec>("ST SA Deallocation - ll", c);
+    bencher::<LLVec>("ST SA Deallocation - ll (unexplained)", c);
 }
 
 //  Single-Threaded Single-Allocation Round-Trip.
