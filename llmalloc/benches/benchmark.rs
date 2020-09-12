@@ -1,4 +1,4 @@
-use std::{alloc::Layout, collections::VecDeque, time};
+use std::{alloc::Layout, collections::VecDeque, sync::{self, atomic}, thread, time};
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
@@ -12,7 +12,7 @@ static LL_ALLOCATOR: LLAllocator = LLAllocator::new();
 //
 //  This is somewhat of a best-case scenario for thread-local caching and measures the lower-bound of allocator latency.
 fn single_threaded_single_allocation_allocation(c: &mut Criterion) {
-    fn bencher<T: Vector>(name: &'static str, c: &mut Criterion) {
+    fn bencher<T: Vector>(name: &str, c: &mut Criterion) {
         c.bench_function(name, |b| b.iter_with_large_drop(
             || black_box(T::with_capacity(32))
         ));
@@ -31,7 +31,7 @@ fn single_threaded_single_allocation_allocation(c: &mut Criterion) {
 //
 //  This is somewhat of a best-case scenario for thread-local caching and measures the lower-bound of allocator latency.
 fn single_threaded_single_allocation_deallocation(c: &mut Criterion) {
-    //  For reasons unfathomable, this benchmark is _completely_ wrecked.
+    //  For reasons unfathomable, this benchmark is _completely_ wrecked on my VM, but works fine on regular hosts.
     //
     //  It consistently returns a measurement of about 5 _micro_ seconds, when allocate+deallocate is under 100ns.
     //
@@ -41,7 +41,7 @@ fn single_threaded_single_allocation_deallocation(c: &mut Criterion) {
     //      measurements_.
     //      -   The assembly only shows an (indirect) call to `LLAllocator::deallocate` within the timed section.
     //  -   Printing 1% and 99% percentiles show a range from 5us to 13us !?!?
-    fn bencher<T: Vector>(name: &'static str, c: &mut Criterion) {
+    fn bencher<T: Vector>(name: &str, c: &mut Criterion) {
         c.bench_function(name, |b| b.iter_custom(|iterations| {
             let mut duration = time::Duration::default();
 
@@ -61,9 +61,9 @@ fn single_threaded_single_allocation_deallocation(c: &mut Criterion) {
 
     LL_ALLOCATOR.warm_up().expect("Warmed up");
 
-    bencher::<SysVec>("ST SA Deallocation - sys (unexplained)", c);
+    bencher::<SysVec>("ST SA Deallocation - sys", c);
 
-    bencher::<LLVec>("ST SA Deallocation - ll (unexplained)", c);
+    bencher::<LLVec>("ST SA Deallocation - ll", c);
 }
 
 //  Single-Threaded Single-Allocation Round-Trip.
@@ -95,7 +95,7 @@ criterion_group!(
 //
 //  This is somewhat of a best-case scenario for thread-local caching and measures the lower-bound of allocator latency.
 fn single_threaded_batch_allocation_allocation(c: &mut Criterion) {
-    fn bencher<T: Vector>(name: &'static str, c: &mut Criterion, number_iterations: usize) {
+    fn bencher<T: Vector>(name: &str, c: &mut Criterion, number_iterations: usize) {
         c.bench_function(name, |b| b.iter_batched_ref(
             || Vec::<T>::with_capacity(number_iterations),
             |v| v.push(black_box(T::with_capacity(32))),
@@ -118,7 +118,7 @@ fn single_threaded_batch_allocation_allocation(c: &mut Criterion) {
 //
 //  This is somewhat of a best-case scenario for thread-local caching and measures the lower-bound of allocator latency.
 fn single_threaded_batch_allocation_deallocation(c: &mut Criterion) {
-    fn bencher<T: Vector>(name: &'static str, c: &mut Criterion, number_iterations: usize) {
+    fn bencher<T: Vector>(name: &str, c: &mut Criterion, number_iterations: usize) {
         c.bench_function(name, |b| b.iter_batched_ref(
             || {
                 let mut v = Vec::<T>::new();
@@ -145,7 +145,7 @@ fn single_threaded_batch_allocation_deallocation(c: &mut Criterion) {
 //
 //  This is somewhat of a best-case scenario for thread-local caching and measures the lower-bound of allocator latency.
 fn single_threaded_batch_allocation_round_trip(c: &mut Criterion) {
-    fn bencher<T: Vector>(name: &'static str, c: &mut Criterion, number_iterations: usize) {
+    fn bencher<T: Vector>(name: &str, c: &mut Criterion, number_iterations: usize) {
         c.bench_function(name, |b| b.iter_batched_ref(
             || {
                 let mut v = VecDeque::<T>::with_capacity(number_iterations);
@@ -176,10 +176,181 @@ criterion_group!(
     single_threaded_batch_allocation_round_trip
 );
 
+//  Multi-Threaded Batch-Allocation Allocation.
+//
+//  This benchmark allocates N blocks of memory _per producer_ on N threads in parallel.
+fn multi_threaded_batch_allocation_allocation(c: &mut Criterion) {
+    fn bencher<T: Vector + Send + 'static>(name: &str, producers: usize, c: &mut Criterion) {
+        bench_function_worst_of_parallel(
+            name,
+            producers,
+            c,
+            |iterations| (0..iterations).map(|_| None).collect::<Vec<Option<T>>>(),
+            || |mut vec| {
+                vec.iter_mut().for_each(|t| *t = Some(black_box(T::with_capacity(32))));
+                vec
+            }
+        );
+    }
+
+    LL_ALLOCATOR.warm_up().expect("Warmed up");
+
+    let number_cpus = num_cpus::get();
+
+    for i in 0.. {
+        let number_producers = 1usize << i;
+
+        if number_producers >= number_cpus {
+            return;
+        }
+
+        bencher::<SysVec>(
+            &format!("PC BA Allocation {}P - sys", number_producers),
+            number_producers,
+            c
+        );
+
+        bencher::<LLVec>(
+            &format!("PC BA Allocation {}P - ll", number_producers),
+            number_producers,
+            c
+        );
+    }
+}
+
+//  Multi-Threaded Batch-Allocation Deallocation.
+//
+//  This benchmark allocates N blocks of memory _per consumer_ on a single thread, then sends them to N consumer
+//  threads which deallocates them in parallel.
+fn multi_threaded_batch_allocation_deallocation(c: &mut Criterion) {
+    fn bencher<T: Vector + Send + 'static>(name: &str, consumers: usize, c: &mut Criterion) {
+        bench_function_worst_of_parallel(
+            name,
+            consumers,
+            c,
+            |iterations| (0..iterations)
+                .map(|_| black_box(T::with_capacity(32)))
+                .collect::<Vec<_>>(),
+            || |vec| std::mem::drop(vec)
+        );
+    }
+
+    LL_ALLOCATOR.warm_up().expect("Warmed up");
+
+    let number_cpus = num_cpus::get();
+
+    for i in 0.. {
+        let number_consumers = 1usize << i;
+
+        if number_consumers >= number_cpus {
+            return;
+        }
+
+        bencher::<SysVec>(
+            &format!("PC BA Deallocation {}C - sys", number_consumers),
+            number_consumers,
+            c
+        );
+
+        bencher::<LLVec>(
+            &format!("PC BA Deallocation {}C - ll", number_consumers),
+            number_consumers,
+            c
+        );
+    }
+}
+
+criterion_group!(
+    multi_threaded_batch_allocation,
+    multi_threaded_batch_allocation_allocation,
+    multi_threaded_batch_allocation_deallocation
+);
+
 criterion_main!(
     single_threaded_single_allocation,
-    single_threaded_batch_allocation
+    single_threaded_batch_allocation,
+    multi_threaded_batch_allocation
 );
+
+//
+//  Benchmark Helpers
+//
+
+//  This helper benchmarks the performance of `number_thread` instances of `G` running in parallel, repeatedly.
+//
+//  Under the hood, this function uses `Criterion::bench_function` and `Bencher::iter_custom`. For each iteration:
+//  -   It calls `setup` to generate 1 `input` per thread, passing the number of iterations indicated by Criterion.
+//  -   It calls `factory` to generate 1 `victim` per thread.
+//  -   It spawns a thread in which it calls the `victim` with the `input`, measuring the elapsed time.
+//
+//  In each iteration, the threads are coordinated by a `rendez_vous` variable; they will busy-wait until the signal
+//  and only then run, maximizing concurrency -- and thus contention.
+//
+//  The final measurement of each call to `Bencher::iter_custom` is the maximum duration experienced by any of the
+//  threads.
+//
+//  Note:   The `victim` may feel free to return a value; the time taken to drop the value is _not_ part of the
+//          measurement.
+fn bench_function_worst_of_parallel<F, S, T, V, Z>(
+    name: &str,
+    number_threads: usize,
+    c: &mut Criterion,
+    mut setup: S,
+    mut factory: F,
+)
+    where
+        F: FnMut() -> V,
+        S: FnMut(usize) -> T,
+        T: Send + 'static,
+        V: FnOnce(T) -> Z + Send + 'static,
+{
+    assert!(number_threads >= 1);
+
+    c.bench_function(name, |b| b.iter_custom(|iterations| {
+        let rendez_vous = sync::Arc::new(atomic::AtomicBool::new(false));
+        let measurements: Vec<_> = (0..number_threads)
+            .map(|_| sync::Arc::new(atomic::AtomicU64::new(0)))
+            .collect();
+
+        let threads: Vec<_> = (0..number_threads)
+            .map(|index| {
+                let rendez_vous = rendez_vous.clone();
+                let measurement = measurements[index].clone();
+                let input = setup(iterations as usize);
+                let victim = factory();
+
+                thread::spawn(move || {
+                    LL_ALLOCATOR.warm_up().expect("Warmed up");
+
+                    //  Busy loop until the signal, to maximize contention.
+                    while !rendez_vous.load(atomic::Ordering::Relaxed) {}
+
+                    let start = time::Instant::now();
+
+                    let _large_drop = black_box(victim(black_box(input)));
+
+                    let duration = start.elapsed();
+
+                    measurement.store(duration.as_nanos() as u64, atomic::Ordering::Relaxed);
+                })
+            })
+            .collect();
+
+        rendez_vous.store(true, atomic::Ordering::Relaxed);
+
+        for thread in threads {
+            thread.join().expect("Joined thread");
+        }
+
+        let duration = measurements.into_iter()
+            .map(|measurement| measurement.load(atomic::Ordering::Relaxed))
+            .map(|nanos| time::Duration::from_nanos(nanos))
+            .max()
+            .expect("At least one element");
+
+        duration
+    }));
+}
 
 //
 //  Implementation Details
@@ -216,6 +387,8 @@ impl Drop for LLVec {
         unsafe { LL_ALLOCATOR.deallocate(self.pointer) }
     }
 }
+
+unsafe impl Send for LLVec {}
 
 fn layout(size: usize, alignment: usize) -> Layout {
     Layout::from_size_align(size, alignment).expect("Valid Layout")

@@ -205,6 +205,12 @@ impl LargePageStack {
                 continue;
             }
 
+            debug_assert!(!head.is_null());
+
+            //  Safety:
+            //  -   `head` is not null.
+            (*head).foreign.next.store(ptr::null_mut());
+
             return head;
         }
     }
