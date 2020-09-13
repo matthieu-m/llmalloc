@@ -307,7 +307,7 @@ fn bench_function_worst_of_parallel<F, S, T, V, Z>(
     assert!(number_threads >= 1);
 
     c.bench_function(name, |b| b.iter_custom(|iterations| {
-        let rendez_vous = sync::Arc::new(atomic::AtomicBool::new(false));
+        let rendez_vous = RendezVous::new(number_threads);
         let measurements: Vec<_> = (0..number_threads)
             .map(|_| sync::Arc::new(atomic::AtomicU64::new(0)))
             .collect();
@@ -322,8 +322,7 @@ fn bench_function_worst_of_parallel<F, S, T, V, Z>(
                 thread::spawn(move || {
                     LL_ALLOCATOR.warm_up().expect("Warmed up");
 
-                    //  Busy loop until the signal, to maximize contention.
-                    while !rendez_vous.load(atomic::Ordering::Relaxed) {}
+                    rendez_vous.wait_until_all_ready();
 
                     let start = time::Instant::now();
 
@@ -335,8 +334,6 @@ fn bench_function_worst_of_parallel<F, S, T, V, Z>(
                 })
             })
             .collect();
-
-        rendez_vous.store(true, atomic::Ordering::Relaxed);
 
         for thread in threads {
             thread.join().expect("Joined thread");
@@ -350,6 +347,23 @@ fn bench_function_worst_of_parallel<F, S, T, V, Z>(
 
         duration
     }));
+}
+
+#[derive(Clone, Debug)]
+struct RendezVous(sync::Arc<atomic::AtomicUsize>);
+
+impl RendezVous {
+    fn new(count: usize) -> Self {
+        Self(sync::Arc::new(atomic::AtomicUsize::new(count)))
+    }
+
+    fn wait_until_all_ready(&self) {
+        self.0.fetch_sub(1, atomic::Ordering::AcqRel);
+
+        while !self.is_ready() {}
+    }
+
+    fn is_ready(&self) -> bool { self.0.load(atomic::Ordering::Acquire) == 0 }
 }
 
 //

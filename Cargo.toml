@@ -5,3 +5,15 @@ members = [
     "llmalloc",
     "llmalloc-c",
 ]
+
+[profile.bench]
+
+debug = true
+
+[profile.release]
+
+debug = true
+
+[profile.test]
+
+debug = true

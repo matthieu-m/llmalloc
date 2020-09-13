@@ -107,6 +107,24 @@ unsafe impl alloc::GlobalAlloc for LLAllocator {
 }
 
 //
+//  Integration test backdoors.
+//
+//  Unfortunately the backdoors have to be exposed as part of the public API for use in integration tests.
+//
+
+impl LLAllocator {
+    /// Exposes the index of the SocketHandle.
+    #[cold]
+    #[doc(hidden)]
+    pub fn socket_index(&self) -> usize { Sockets::current_node() }
+
+    /// Exposes the index of the ThreadHandle.
+    #[cold]
+    #[doc(hidden)]
+    pub fn thread_index(&self) -> usize { THREAD_LOCAL.get() as usize }
+}
+
+//
 //  Implementation
 //
 
@@ -129,6 +147,8 @@ static THREAD_LOCAL: LLThreadLocal<u8> = unsafe { LLThreadLocal::new(drop_handle
 
 #[cold]
 unsafe extern "C" fn drop_handle(handle: *mut u8) {
+    assert!(!handle.is_null());
+
     let thread = ThreadHandle::from_pointer(handle);
     let socket: SocketHandle = thread.socket();
     socket.release_thread_handle(thread);
