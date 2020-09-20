@@ -94,6 +94,16 @@ fn producer_consumer_ring() {
 
     #[inline(never)]
     fn shuffle_ring(ring: &[sync::Mutex<Vec<Pointer<String>>>]) {
+        fn swap_head(vec: &mut Vec<&mut Pointer<String>>, index: usize) {
+            debug_assert!(index > 0);
+
+            let (head, tail) = vec.split_at_mut(index);
+            let head: &mut Pointer<String> = head[0];
+            let tail: &mut Pointer<String> = tail[0];
+
+            std::mem::swap(head, tail);
+        }
+
         let number_threads = ring.len();
         assert!(number_threads >= 2, "number_threads: {} < 2", number_threads);
 
@@ -114,7 +124,7 @@ fn producer_consumer_ring() {
                 //  A single shift goes from [A, B, C, D] to [D, A, B, C].
                 //  By iterating `shift` times, A shifts by that many places to the right.
                 for target in 1..number_threads {
-                    layer.swap(0, target);
+                    swap_head(&mut layer, target);
                 }
             }
         }
