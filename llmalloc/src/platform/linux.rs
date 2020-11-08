@@ -58,10 +58,14 @@ impl Platform for LLPlatform {
     #[inline(never)]
     fn current_node(&self) -> NumaNodeIndex {
         let cpu = unsafe { libc::sched_getcpu() };
+        assert!(cpu >= 0, "Expected CPU index, got {}", cpu);
+
         let node = unsafe { numa_node_of_cpu(cpu) };
 
-        assert!(cpu >= 0, "Expected CPU index, got {}", cpu);
-        assert!(node >= 0, "Expected NUMA Node index, got {}", node);
+        //  If libnuma cannot find the appropriate node (such as under WSL), then use 0 as fallback.
+        if node < 0 {
+            return NumaNodeIndex::new(0);
+        }
 
         select_node(NumaNodeIndex::new(node as u32))
     }
