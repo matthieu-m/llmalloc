@@ -733,12 +733,14 @@ impl<C> ThreadLocalsManager<C>
 
     //  Acquires a ThreadLocal, if possible.
     fn acquire(&self) -> Option<ptr::NonNull<ThreadLocal<C>>> {
+        const RELAXED: atomic::Ordering = atomic::Ordering::Relaxed;
+
         //  Pick one from stack, if any.
         if let Some(thread_local) = self.pop() {
             return Some(thread_local);
         }
 
-        let mut current = self.watermark.load(atomic::Ordering::Relaxed);
+        let mut current = self.watermark.load(RELAXED);
         let end = self.end;
 
         while current < end {
@@ -746,13 +748,10 @@ impl<C> ThreadLocalsManager<C>
             //  -   `next` still within original `buffer`, as `current < end`.
             let next = unsafe { current.add(Self::THREAD_LOCAL_SIZE) };
 
-            let previous = self.watermark.compare_and_swap(current, next, atomic::Ordering::Relaxed);
-
-            if previous == current {
-                break;
+            match self.watermark.compare_exchange(current, next, RELAXED, RELAXED) {
+                Ok(_) => break,
+                Err(previous) => current = previous,
             }
-
-            current = previous;
         }
 
         //  Acquisition failed.

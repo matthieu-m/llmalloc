@@ -103,18 +103,19 @@ impl<T> LLThreadLocal<T> {
     #[cold]
     #[inline(never)]
     unsafe fn initialize(&self) -> libc::pthread_key_t {
-        let mut key = self.key.load(atomic::Ordering::Relaxed);
+        const RELAXED: atomic::Ordering = atomic::Ordering::Relaxed;
 
-        if self.key.compare_and_swap(Self::UNINITIALIZED, Self::UNDER_INITIALIZATION, atomic::Ordering::Relaxed)
-            == Self::UNINITIALIZED
+        let mut key = self.key.load(RELAXED);
+
+        if let Ok(_) = self.key.compare_exchange(Self::UNINITIALIZED, Self::UNDER_INITIALIZATION, RELAXED, RELAXED)
         {
             key = self.create_key();
-            self.key.store(key, atomic::Ordering::Relaxed);
+            self.key.store(key, RELAXED);
         }
 
         while key < 0 {
             libc::sched_yield();
-            key = self.key.load(atomic::Ordering::Relaxed);
+            key = self.key.load(RELAXED);
         }
 
         key as libc::pthread_key_t
