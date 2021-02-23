@@ -462,8 +462,11 @@ impl Foreign {
     ///
     /// #   Safety
     ///
+    /// -   Assumes that the linked cells are not empty.
     /// -   Assumes that the linked cells actually belong to the page!
     unsafe fn refill(&self, list: &CellForeignList) -> bool {
+        //  Safety:
+        //  -   `list` is assumed not be empty.
         let len = self.freed.extend(list);
 
         if len < self.catch_threshold {

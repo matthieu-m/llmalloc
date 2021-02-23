@@ -77,8 +77,9 @@ impl<C> ThreadLocal<C>
             let large_page = unsafe { &*page };
 
             //  Safety:
-            //  -   The linked-cells belong to the page.
             //  -   The access to `foreign_list` is exclusive.
+            //  -   `foreign_list` is not empty.
+            //  -   `foreign_list` belongs to the page.
             unsafe { large_page.refill_foreign(foreign_list, &mut recycler) };
         }
     }

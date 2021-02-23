@@ -735,11 +735,6 @@ impl<C> ThreadLocalsManager<C>
     fn acquire(&self) -> Option<ptr::NonNull<ThreadLocal<C>>> {
         //  Pick one from stack, if any.
         if let Some(thread_local) = self.pop() {
-            //  Safety:
-            //  -   `thread_local` is valid for writes.
-            //  -   `thread_local` is properly aligned.
-            unsafe { ptr::write(thread_local.as_ptr(), ThreadLocal::new(self.owner)) };
-
             return Some(thread_local);
         }
 
@@ -793,7 +788,10 @@ impl<C> ThreadLocalsManager<C>
     fn pop(&self) -> Option<ptr::NonNull<ThreadLocal<C>>> {
         self.stack.pop().map(|cell| {
             let thread_local = cell.cast();
-            unsafe { ptr::write(thread_local.as_ptr(), ThreadLocal::default()) };
+            //  Safety:
+            //  -   `thread_local` is valid for writes.
+            //  -   `thread_local` is properly aligned.
+            unsafe { ptr::write(thread_local.as_ptr(), ThreadLocal::new(self.owner)) };
             thread_local
         })
     }
