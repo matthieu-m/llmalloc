@@ -7,7 +7,7 @@ use core::{
 
 use crate::{PowerOf2, utils};
 
-use super::{AtomicBlockForeign, AtomicBlockForeignPtr, BlockForeign, BlockForeignList, BlockPtr};
+use super::{AtomicBlockForeign, AtomicBlockForeignList, BlockForeign, BlockForeignList, BlockPtr};
 
 /// BlockLocal.
 ///
@@ -79,12 +79,12 @@ impl BlockLocal {
     //  Returns whether the layout of AtomicBlockForeign and BlockLocal are compatible.
     //
     //  The layout are compatible if:
-    //  -   BlockLocalStack and AtomicBlockForeignPtr are both plain pointers, size-wise.
+    //  -   BlockLocalStack and AtomicBlockForeignList are both plain pointers, size-wise.
     //  -   BlockLocal::next and AtomicBlockForeign::next are placed at the same offset.
     fn are_layout_compatible(foreign: NonNull<AtomicBlockForeign>, local: NonNull<BlockLocal>) -> bool {
         const PTR_SIZE: usize = mem::size_of::<*const u8>();
 
-        if mem::size_of::<BlockLocalStack>() != PTR_SIZE || mem::size_of::<AtomicBlockForeignPtr>() != PTR_SIZE {
+        if mem::size_of::<BlockLocalStack>() != PTR_SIZE || mem::size_of::<AtomicBlockForeignList>() != PTR_SIZE {
             return false;
         }
 
