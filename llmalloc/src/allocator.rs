@@ -1,6 +1,9 @@
 //! Allocator
 
-use core::{alloc, ptr};
+use core::{
+    alloc::GlobalAlloc,
+    ptr::{self, NonNull},
+};
 
 use llmalloc_core::{self, Configuration, Layout, PowerOf2};
 
@@ -47,11 +50,11 @@ impl LLAllocator {
     /// Allocates `size` bytes of memory, aligned on at least an `alignment` boundary.
     ///
     /// If allocation fails, the returned pointer may be NULL.
-    pub fn allocate(&self, layout: Layout) -> *mut u8 {
+    pub fn allocate(&self, layout: Layout) -> Option<NonNull<u8>> {
         debug_assert!(layout.align().count_ones() == 1);
 
         if layout.align() > LLConfiguration::HUGE_PAGE_SIZE.value() {
-            return ptr::null_mut();
+            return None;
         }
 
         //  Safety:
@@ -75,7 +78,7 @@ impl LLAllocator {
             return thread_local.allocate(layout);
         }
 
-        ptr::null_mut()
+        None
     }
 
     /// Deallocates the memory located at `pointer`.
@@ -85,11 +88,7 @@ impl LLAllocator {
     /// -   Assumes `pointer` has been returned by a prior call to `allocate`.
     /// -   Assumes `pointer` has not been deallocated since its allocation.
     /// -   Assumes the memory pointed by `pointer` is no longer in use.
-    pub unsafe fn deallocate(&self, pointer: *mut u8) {
-        if pointer.is_null() {
-            return;
-        }
-
+    pub unsafe fn deallocate(&self, pointer: NonNull<u8>) {
         if let Some(thread_local) = Thread::get().or_else(Thread::initialize) {
             return thread_local.deallocate(pointer);
         }
@@ -100,10 +99,16 @@ impl LLAllocator {
     }
 }
 
-unsafe impl alloc::GlobalAlloc for LLAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 { self.allocate(layout) }
+unsafe impl GlobalAlloc for LLAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.allocate(layout).map(|ptr| ptr.as_ptr()).unwrap_or(ptr::null_mut())
+    }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _: Layout) { self.deallocate(ptr) }
+    unsafe fn dealloc(&self, ptr: *mut u8, _: Layout) {
+        if let Some(ptr) = NonNull::new(ptr) {
+            self.deallocate(ptr);
+        }
+    }
 }
 
 //
@@ -121,7 +126,9 @@ impl LLAllocator {
     /// Exposes the index of the ThreadHandle.
     #[cold]
     #[doc(hidden)]
-    pub fn thread_index(&self) -> usize { THREAD_LOCAL.get() as usize }
+    pub fn thread_index(&self) -> usize {
+        THREAD_LOCAL.get().map(|ptr| ptr.as_ptr() as usize).unwrap_or(0)
+    }
 }
 
 //
@@ -147,7 +154,7 @@ static THREAD_LOCAL: LLThreadLocal<u8> = unsafe { LLThreadLocal::new(drop_handle
 
 #[cold]
 unsafe extern "C" fn drop_handle(handle: *mut u8) {
-    assert!(!handle.is_null());
+    let handle = NonNull::new(handle).expect("Non-null handle");
 
     let thread = ThreadHandle::from_pointer(handle);
     let socket: SocketHandle = thread.socket();
@@ -160,8 +167,8 @@ impl Thread {
     //  Returns a pointer to the thread-local instance, if initialized.
     #[inline(always)]
     fn get() -> Option<Thread> {
-        let pointer = THREAD_LOCAL.get();
-        if pointer.is_null() { None } else { unsafe { Some(Self(ThreadHandle::from_pointer(pointer))) } }
+        THREAD_LOCAL.get()
+            .map(|pointer| unsafe { Self(ThreadHandle::from_pointer(pointer)) })
     }
 
     //  Initializes the thread-local instance and attempts to return a reference to it.
@@ -183,12 +190,15 @@ impl Thread {
     //
     //  If allocation fails, the returned pointer may be NULL.
     #[inline(always)]
-    fn allocate(&self, layout: Layout) -> *mut u8 {
+    fn allocate(&self, layout: Layout) -> Option<NonNull<u8>> {
         //  Safety:
         //  -   Only uses SocketHandle type.
         let socket: SocketHandle = unsafe { self.0.socket() };
 
-        //  Safety: TODO
+        //  Safety:
+        //  -   `layout` is valid.
+        //  -   `self.0` belongs `socket`.
+        //  -   `self.0` is exclusively accessed from this thread.
         unsafe { socket.allocate(&self.0, layout) }
     }
 
@@ -200,9 +210,7 @@ impl Thread {
     //  -   Assumes `pointer` has not been deallocated since its allocation.
     //  -   Assumes the memory pointed by `pointer` is no longer in use.
     #[inline(always)]
-    unsafe fn deallocate(&self, pointer: *mut u8) {
-        debug_assert!(!pointer.is_null());
-
+    unsafe fn deallocate(&self, pointer: NonNull<u8>) {
         //  Safety:
         //  -   Only uses SocketHandle type.
         let socket: SocketHandle = self.0.socket();

@@ -11,7 +11,10 @@
 //! The Configuration instance allows adjusting the thresholds of those categories to better match the underlying
 //! platform native page sizes.
 
-use core::num;
+use core::{
+    num,
+    ptr::NonNull,
+};
 
 use super::{AllocationSize, Category, ClassSize, Layout, PowerOf2};
 
@@ -23,6 +26,7 @@ pub trait Configuration {
     ///
     /// The minimum this size can be is 4096, as the header of 512 bytes cannot exceed 1/8th of the page.
     const LARGE_PAGE_SIZE: PowerOf2;
+
     /// The size of Huge Pages, from which Large allocations are produced.
     ///
     /// Allocations from the Platform are always requested as multiple of this page size.
@@ -57,10 +61,8 @@ impl<C> Properties<C>
     }
 
     /// Returns the category of a pointer, based on its alignment.
-    pub fn category_of_pointer(ptr: *mut u8) -> Category {
-        debug_assert!(!ptr.is_null());
-
-        let ptr = ptr as usize;
+    pub fn category_of_pointer(ptr: NonNull<u8>) -> Category {
+        let ptr = ptr.as_ptr() as usize;
 
         if ptr % C::LARGE_PAGE_SIZE != 0 {
             Category::Normal
@@ -152,7 +154,7 @@ fn properties_large_threshold() {
 #[test]
 fn properties_category_of_pointer() {
     fn category(ptr: usize) -> Category {
-        TestProperties::category_of_pointer(ptr as *mut u8)
+        TestProperties::category_of_pointer(NonNull::new(ptr as *mut u8).unwrap())
     }
 
     assert_eq!(Category::Normal, category(1 << 0));

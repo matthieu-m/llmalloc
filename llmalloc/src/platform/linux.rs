@@ -1,6 +1,12 @@
 //! Implementation of Linux specific calls.
 
-use core::{alloc::Layout, marker, mem, ptr, sync::atomic};
+use core::{
+    alloc::Layout,
+    marker::PhantomData,
+    mem,
+    ptr::{self, NonNull},
+    sync::atomic,
+};
 
 use llmalloc_core::{self, PowerOf2};
 
@@ -28,7 +34,7 @@ impl LLPlatform {
 }
 
 impl llmalloc_core::Platform for LLPlatform {
-    unsafe fn allocate(&self, layout: Layout) -> *mut u8 {
+    unsafe fn allocate(&self, layout: Layout) -> Option<NonNull<u8>> {
         const HUGE_PAGE_SIZE: PowerOf2 = LLConfiguration::HUGE_PAGE_SIZE;
 
         assert!(layout.size() % HUGE_PAGE_SIZE == 0,
@@ -38,18 +44,16 @@ impl llmalloc_core::Platform for LLPlatform {
 
         let candidate = mmap_huge(layout.size())
             .or_else(|| mmap_exact(layout.size()))
-            .or_else(|| mmap_over(layout.size()))
-            .map(|pointer| pointer.as_ptr())
-            .unwrap_or(ptr::null_mut());
+            .or_else(|| mmap_over(layout.size()))?;
 
-        debug_assert!(candidate as usize % HUGE_PAGE_SIZE == 0,
-            "Incorrect alignment of allocation: {:x} % {:x} != 0", candidate as usize, HUGE_PAGE_SIZE.value());
+        debug_assert!(candidate.as_ptr() as usize % HUGE_PAGE_SIZE == 0,
+            "Incorrect alignment of allocation: {:x} % {:x} != 0", candidate.as_ptr() as usize, HUGE_PAGE_SIZE.value());
 
-        candidate
+        Some(candidate)
     }
 
-    unsafe fn deallocate(&self, pointer: *mut u8, layout: Layout) {
-        munmap_deallocate(pointer, layout.size());
+    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
+        munmap_deallocate(pointer.as_ptr(), layout.size());
     }
 }
 
@@ -75,7 +79,7 @@ impl Platform for LLPlatform {
 pub(crate) struct LLThreadLocal<T> {
     key: atomic::AtomicI64,
     destructor: *const u8,
-    _marker: marker::PhantomData<*const T>,
+    _marker: PhantomData<*const T>,
 }
 
 impl<T> LLThreadLocal<T> {
@@ -89,7 +93,7 @@ impl<T> LLThreadLocal<T> {
     /// -   Assumes that `destructor` points to an `unsafe extern "C" fn(*mut c_void)` function, or compatible.
     pub(crate) const unsafe fn new(destructor: *const u8) -> Self {
         let key = atomic::AtomicI64::new(-1);
-        let _marker = marker::PhantomData;
+        let _marker = PhantomData;
 
         LLThreadLocal { key, destructor, _marker }
     }
@@ -136,19 +140,19 @@ impl<T> LLThreadLocal<T> {
 }
 
 impl<T> ThreadLocal<T> for LLThreadLocal<T> {
-    fn get(&self) -> *mut T {
+    fn get(&self) -> Option<NonNull<T>> {
         let key = self.key.load(atomic::Ordering::Relaxed);
 
         //  If key is not initialized, then a null pointer is returned.
-        unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) as *mut T }
+        NonNull::new(unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) as *mut T })
     }
 
     #[cold]
     #[inline(never)]
-    fn set(&self, value: *mut T) {
+    fn set(&self, value: NonNull<T>) {
         let key = self.get_key();
 
-        let result = unsafe { libc::pthread_setspecific(key, value as *mut libc::c_void) };
+        let result = unsafe { libc::pthread_setspecific(key, value.as_ptr() as *mut libc::c_void) };
         assert!(result == 0, "Could not set thread-local value for {}: {}", key, result);
     }
 }
@@ -179,7 +183,7 @@ fn select_node(original: NumaNodeIndex) -> NumaNodeIndex {
 //  Attempts to allocate the required size in Huge Pages.
 //
 //  If non-null, the result is aligned on `HUGE_PAGE_SIZE`.
-fn mmap_huge(size: usize) -> Option<ptr::NonNull<u8>> {
+fn mmap_huge(size: usize) -> Option<NonNull<u8>> {
     const MAP_HUGE_SHIFT: u8 = 26;
 
     const MAP_HUGE_1GB: libc::c_int = 30 << MAP_HUGE_SHIFT;
@@ -191,7 +195,7 @@ fn mmap_huge(size: usize) -> Option<ptr::NonNull<u8>> {
 //  Attempts to allocate the required size in Normal (or Large) Pages.
 //
 //  If non-null, the result is aligned on `HUGE_PAGE_SIZE`.
-fn mmap_exact(size: usize) -> Option<ptr::NonNull<u8>> {
+fn mmap_exact(size: usize) -> Option<NonNull<u8>> {
     mmap_allocate(size, 0)
         .and_then(|pointer| unsafe { mmap_check(pointer, size) })
 }
@@ -199,7 +203,7 @@ fn mmap_exact(size: usize) -> Option<ptr::NonNull<u8>> {
 //  Attempts to allocate the required size in Normal (or Large) Pages.
 //
 //  Ensures the alignment is met by over-allocated then trimming front and back.
-fn mmap_over(size: usize) -> Option<ptr::NonNull<u8>> {
+fn mmap_over(size: usize) -> Option<NonNull<u8>> {
     const ALIGNMENT: PowerOf2 = LLConfiguration::HUGE_PAGE_SIZE;
 
     let over_size = size + ALIGNMENT.value();
@@ -239,9 +243,7 @@ fn mmap_over(size: usize) -> Option<ptr::NonNull<u8>> {
         unsafe { munmap_deallocate(back_pointer, back_size) };
     }
 
-    //  Safety:
-    //  -   `aligned_pointer` is not null.
-    Some(unsafe { ptr::NonNull::new_unchecked(aligned_pointer) })
+    NonNull::new(aligned_pointer)
 }
 
 //  `mmap` alignment checker.
@@ -253,7 +255,7 @@ fn mmap_over(size: usize) -> Option<ptr::NonNull<u8>> {
 //
 //  -   Assumes that `pointer` points to a `mmap`ed area of at least `size` bytes.
 //  -   Assumes that `pointer` is no longer in use, unless returned.
-unsafe fn mmap_check(pointer: ptr::NonNull<u8>, size: usize) -> Option<ptr::NonNull<u8>> {
+unsafe fn mmap_check(pointer: NonNull<u8>, size: usize) -> Option<NonNull<u8>> {
     const ALIGNMENT: PowerOf2 = LLConfiguration::HUGE_PAGE_SIZE;
 
     if pointer.as_ptr() as usize % ALIGNMENT == 0 {
@@ -270,7 +272,7 @@ unsafe fn mmap_check(pointer: ptr::NonNull<u8>, size: usize) -> Option<ptr::NonN
 //  Wrapper around `mmap`.
 //
 //  Returns a pointer to `size` bytes of memory; does not guarantee any alignment.
-fn mmap_allocate(size: usize, extra_flags: i32) -> Option<ptr::NonNull<u8>> {
+fn mmap_allocate(size: usize, extra_flags: i32) -> Option<NonNull<u8>> {
     let length = size;
     let prot = libc::PROT_READ | libc::PROT_WRITE;
     let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | extra_flags;
@@ -287,7 +289,7 @@ fn mmap_allocate(size: usize, extra_flags: i32) -> Option<ptr::NonNull<u8>> {
     let result = unsafe { libc::mmap(addr, length, prot, flags, fd, offset) };
 
     let result = if result != libc::MAP_FAILED { result as *mut u8 } else { ptr::null_mut() };
-    ptr::NonNull::new(result)
+    NonNull::new(result)
 }
 
 //  Wrapper around `munmap`.

@@ -12,17 +12,29 @@
 //! The name comes from the socket in which a CPU is plugged in, as a recommendation to use one instance of SocketLocal
 //! for each socket.
 
-use core::{alloc::Layout, cmp, marker, mem, num, ptr, slice, sync::atomic};
+use core::{
+    alloc::Layout,
+    cmp,
+    marker::PhantomData,
+    mem,
+    num,
+    ptr::{self, NonNull},
+    slice,
+    sync::atomic::{self, Ordering},
+};
 
 use crate::{Category, ClassSize, Configuration, Platform, PowerOf2, Properties};
-use crate::internals::{
-    cells::{CellAtomicForeign, CellForeign, CellForeignList, CellAtomicForeignStack},
-    huge_allocator::HugeAllocator,
-    huge_page::HugePage,
-    large_page::{LargePage, LargePageStack},
-    thread_local::{ThreadLocal},
+use crate::{
+    internals::{
+        atomic::AtomicPtr,
+        blocks::{AtomicBlockForeign, BlockForeign, BlockForeignList, AtomicBlockForeignStack},
+        huge_allocator::HugeAllocator,
+        huge_page::HugePage,
+        large_page::{LargePage, LargePageStack},
+        thread_local::{ThreadLocal},
+    },
+    utils,
 };
-use crate::utils;
 
 /// SocketLocal.
 #[repr(align(128))]
@@ -46,18 +58,14 @@ where
     /// Attempts to allocate a `HugePage` and creates an instance of SocketLocal within it.
     ///
     /// Returns a valid pointer to Self if the bootstrap is successful, and None otherwise.
-    pub(crate) fn bootstrap(huge_allocator: &'a HugeAllocator<C, P>) -> Option<ptr::NonNull<Self>> {
-        let page = HugePagesManager::<C, P>::allocate_huge_page(huge_allocator.platform(), ptr::null_mut());
-
-        if page.is_null() {
-            return None;
-        }
+    pub(crate) fn bootstrap(huge_allocator: &'a HugeAllocator<C, P>) -> Option<NonNull<Self>> {
+        let mut page = HugePagesManager::<C, P>::allocate_huge_page(huge_allocator.platform(), ptr::null_mut())?;
 
         //  Safety:
         //  -   `page` is not null.
         //  -   `page` is assumed to be suitably aligned.
         //  -   `page` points to an exclusive memory area.
-        let huge_page = unsafe { &mut *page };
+        let huge_page = unsafe { page.as_mut() };
 
         let place = huge_page.buffer_mut();
 
@@ -94,7 +102,7 @@ where
         //  Safety:
         //  -   `socket_place` is sufficiently sized.
         //  -   `socket_place` is sufficiently aligned.
-        let mut result = unsafe { Self::initialize(socket_place, huge_allocator) };
+        let mut result = unsafe { Self::initialize(socket_place, huge_allocator, thread_locals) };
 
         huge_page.set_owner(result.as_ptr() as *mut ());
 
@@ -102,8 +110,7 @@ where
         //  -   `result` is not null.
         //  -   `result` is exclusive.
         let socket = unsafe { result.as_mut() };
-        socket.huge_pages.0[0].store(huge_page);
-        socket.thread_locals = thread_locals;
+        socket.huge_pages.0[0].store(Some(page));
 
         Some(result)
     }
@@ -138,7 +145,7 @@ where
     /// Attempts to acquire a `ThreadLocal` from within the buffer area of the first HugePage.
     ///
     /// Returns a valid pointer to `ThreadLocal` if successful, and None otherwise.
-    pub(crate) fn acquire_thread_local(&self) -> Option<ptr::NonNull<ThreadLocal<C>>> {
+    pub(crate) fn acquire_thread_local(&self) -> Option<NonNull<ThreadLocal<C>>> {
         self.thread_locals.acquire()
     }
 
@@ -147,9 +154,9 @@ where
     /// #   Safety
     ///
     /// -   Assumes that the `ThreadLocal` comes from `self`.
-    pub(crate) unsafe fn release_thread_local(&self, thread_local: ptr::NonNull<ThreadLocal<C>>) {
+    pub(crate) unsafe fn release_thread_local(&self, thread_local: NonNull<ThreadLocal<C>>) {
         debug_assert!((self.as_owner() as usize) < (thread_local.as_ptr() as usize));
-        debug_assert!((thread_local.as_ptr() as usize) < (self.thread_locals.end as usize));
+        debug_assert!((thread_local.as_ptr() as usize) < (self.thread_locals.end.as_ptr() as usize));
 
         //  Safety:
         //  -   `thread_local` is not null.
@@ -172,7 +179,7 @@ where
     /// -   `thread_local` is not concurrently accessed by another thread.
     /// -   `layout` is valid, as per `Self::is_valid_layout`.
     #[inline(always)]
-    pub(crate) unsafe fn allocate(&self, thread_local: &ThreadLocal<C>, layout: Layout) -> *mut u8 {
+    pub(crate) unsafe fn allocate(&self, thread_local: &ThreadLocal<C>, layout: Layout) -> Option<NonNull<u8>> {
         debug_assert!(Self::is_valid_layout(layout));
 
         match Properties::<C>::category_of_size(layout.size()) {
@@ -192,7 +199,7 @@ where
     /// -   `thread_local` is not concurrently accessed by another thread.
     /// -   `ptr` is a value allocated by an instance of `Self`, and the same underlying `Platform`.
     #[inline(always)]
-    pub(crate) unsafe fn deallocate(&self, thread_local: &ThreadLocal<C>, ptr: *mut u8) {
+    pub(crate) unsafe fn deallocate(&self, thread_local: &ThreadLocal<C>, ptr: NonNull<u8>) {
         match Properties::<C>::category_of_pointer(ptr) {
             Category::Normal => self.deallocate_normal(thread_local, ptr),
             Category::Large => self.deallocate_large(ptr),
@@ -213,7 +220,7 @@ where
     /// -   `thread_local` is not concurrently accessed by another thread.
     /// -   `ptr` is a value allocated by an instance of `Self`, and the same underlying `Platform`.
     #[inline(always)]
-    pub(crate) unsafe fn deallocate_uncached(&self, ptr: *mut u8) {
+    pub(crate) unsafe fn deallocate_uncached(&self, ptr: NonNull<u8>) {
         match Properties::<C>::category_of_pointer(ptr) {
             Category::Normal => self.deallocate_normal_uncached(ptr),
             Category::Large => self.deallocate_large(ptr),
@@ -222,10 +229,9 @@ where
     }
 
     //  Internal; Creates a new instance of SocketLocal.
-    fn new(huge_allocator: &'a HugeAllocator<C, P>) -> Self {
+    fn new(huge_allocator: &'a HugeAllocator<C, P>, thread_locals: ThreadLocalsManager<C>) -> Self {
         let large_pages = unsafe { mem::zeroed() };
         let huge_pages = HugePagesManager::new();
-        let thread_locals = ThreadLocalsManager::default();
 
         SocketLocal { large_pages, huge_pages, huge_allocator, thread_locals, }
     }
@@ -238,27 +244,31 @@ where
     //  #   Safety
     // 
     //  -   Assumes that `place` is of sufficient size and alignment.
-    unsafe fn initialize( place: &mut [u8], huge_allocator: &'a HugeAllocator<C, P>) -> ptr::NonNull<Self> {
+    unsafe fn initialize(
+        place: &mut [u8],
+        huge_allocator: &'a HugeAllocator<C, P>,
+        thread_locals: ThreadLocalsManager<C>,
+    )
+        -> NonNull<Self>
+    {
         debug_assert!(place.len() >= mem::size_of::<Self>());
 
-        let at = place.as_mut_ptr();
+        //  Safety:
+        //  -   `place` is not a null slice.
+        let at = NonNull::new_unchecked(place.as_mut_ptr());
 
-        debug_assert!(!at.is_null());
         debug_assert!(utils::is_sufficiently_aligned_for(at, PowerOf2::align_of::<Self>()));
 
         //  Safety:
         //  -   Sufficient size is assumed.
         //  -   Sufficient alignment is assumed.
-        #[allow(clippy::cast_ptr_alignment)]
-        let result: *mut Self = at as *mut Self;
+        let result: NonNull<Self> = at.cast();
 
         //  Safety:
         //  -   `result` is valid for writes.
-        ptr::write(result, Self::new(huge_allocator));
+        ptr::write(result.as_ptr(), Self::new(huge_allocator, thread_locals));
 
-        //  Safety:
-        //  -   `result` is not null.
-        ptr::NonNull::new_unchecked(result)
+        result
     }
 
     //  Internal; Allocates a Normal allocation.
@@ -268,7 +278,7 @@ where
     //  -   Assumes `thread_local` is not concurrently accessed by another thread.
     //  -   Assumes that `layout` is valid, as per `Self::is_valid_layout`.
     #[inline(always)]
-    unsafe fn allocate_normal(&self, thread_local: &ThreadLocal<C>, layout: Layout) -> *mut u8 {
+    unsafe fn allocate_normal(&self, thread_local: &ThreadLocal<C>, layout: Layout) -> Option<NonNull<u8>> {
         debug_assert!(Self::is_valid_layout(layout));
 
         //  Safety:
@@ -289,8 +299,8 @@ where
     //  -   Assumes `thread_local` is not concurrently accessed by another thread.
     //  -   Assumes that `ptr` is a Normal allocation allocated by an instance of `Self`.
     #[inline(never)]
-    unsafe fn deallocate_normal(&self, thread_local: &ThreadLocal<C>, ptr: *mut u8) {
-        debug_assert!((ptr as usize) % C::LARGE_PAGE_SIZE != 0);
+    unsafe fn deallocate_normal(&self, thread_local: &ThreadLocal<C>, ptr: NonNull<u8>) {
+        debug_assert!((ptr.as_ptr() as usize) % C::LARGE_PAGE_SIZE != 0);
 
         //  Safety:
         //  -   `thread_local` is assumed not be accessed concurrently from another thread.
@@ -303,27 +313,25 @@ where
     //
     //  -   Assumes that `ptr` is a Normal allocation allocated by an instance of `Self`.
     #[inline(never)]
-    unsafe fn deallocate_normal_uncached(&self, ptr: *mut u8) {
-        debug_assert!((ptr as usize) % C::LARGE_PAGE_SIZE != 0);
-        debug_assert!(!ptr.is_null());
+    unsafe fn deallocate_normal_uncached(&self, ptr: NonNull<u8>) {
+        debug_assert!((ptr.as_ptr() as usize) % C::LARGE_PAGE_SIZE != 0);
 
         //  Safety:
         //  -   `ptr` is assumed to point to memory that is no longer in use.
         //  -   `ptr` is assumed to point to a sufficiently large memory area.
         //  -   `ptr` is assumed to be correctly aligned.
-        let cell = CellForeign::initialize(ptr);
+        let cell = BlockForeign::initialize(ptr);
 
-        let foreign_list = CellForeignList::default();
+        let foreign_list = BlockForeignList::default();
         foreign_list.push(cell);
 
         //  Safety:
         //  -   `ptr` is assumed to belong to a `LargePage`.
         let page = LargePage::from_raw::<C>(ptr);
-        debug_assert!(!page.is_null());
 
         //  Safety:
         //  -   `page` is not null.
-        let large_page = &*page;
+        let large_page = page.as_ref();
 
         large_page.refill_foreign(&foreign_list, |page| Self::catch_large_page(page));
         debug_assert!(foreign_list.is_empty());
@@ -334,7 +342,7 @@ where
     //  #   Safety
     //
     //  -   Assumes that `layout` is valid, as per `Self::is_valid_layout`.
-    unsafe fn allocate_large(&self, layout: Layout) -> *mut u8 {
+    unsafe fn allocate_large(&self, layout: Layout) -> Option<NonNull<u8>> {
         self.huge_pages.allocate_large(layout, self.as_owner(), self.platform())
     }
 
@@ -343,14 +351,14 @@ where
     //  #   Safety
     //
     //  -   Assumes that `ptr` is a Large allocation allocated by an instance of `Self`.
-    unsafe fn deallocate_large(&self, ptr: *mut u8) { self.huge_pages.deallocate_large(ptr); }
+    unsafe fn deallocate_large(&self, ptr: NonNull<u8>) { self.huge_pages.deallocate_large(ptr); }
 
     // Internal;  Allocates a Huge allocation.
     //
     //  #   Safety
     //
     //  -   Assumes that `layout` is valid, as per `Self::is_valid_layout`.
-    unsafe fn allocate_huge(&self, layout: Layout) -> *mut u8 {
+    unsafe fn allocate_huge(&self, layout: Layout) -> Option<NonNull<u8>> {
         debug_assert!(Self::is_valid_layout(layout));
 
         self.huge_allocator.allocate_huge(layout)
@@ -361,7 +369,7 @@ where
     //  #   Safety
     //
     //  -   Assumes that `ptr` is a Huge allocation allocated by an instance of `Self` sharing the same manager.
-    unsafe fn deallocate_huge(&self, ptr: *mut u8) { self.huge_allocator.deallocate_huge(ptr); }
+    unsafe fn deallocate_huge(&self, ptr: NonNull<u8>) { self.huge_allocator.deallocate_huge(ptr); }
 
     //  Internal; Returns the address of `self`.
     fn as_owner(&self) -> *mut () { self as *const Self as *mut Self as *mut () }
@@ -373,7 +381,7 @@ where
     //  -   Assumes that `class_size` is in bounds.
     //  -   Assumes that `C::LARGE_PAGE_SIZE` is large enough for a `LargePage`.
     #[inline(never)]
-    unsafe fn allocate_large_page(&self, class_size: ClassSize) -> *mut LargePage {
+    unsafe fn allocate_large_page(&self, class_size: ClassSize) -> Option<NonNull<LargePage>> {
         debug_assert!(class_size.value() < self.large_pages.len());
 
         //  Fast Path: locate an existing one!
@@ -382,7 +390,7 @@ where
         //  -   `class_size` is in bounds.
         let large_page = self.large_pages.get_unchecked(class_size.value()).pop();
 
-        if !large_page.is_null() {
+        if large_page.is_some() {
             return large_page;
         }
 
@@ -397,31 +405,25 @@ where
 
         //  Safety:
         //  -   `layout` is valid.
-        let large_page = self.allocate_large(layout);
-
-        if large_page.is_null() {
-            return ptr::null_mut();
-        }
+        let large_page = self.allocate_large(layout)?;
 
         //  Safety:
         //  -   `large_page` is not null.
         //  -   `size` is assumed to be the size of the memory allocation.
-        let place = slice::from_raw_parts_mut(large_page, size);
+        let place = slice::from_raw_parts_mut(large_page.as_ptr(), size);
 
         //  Safety:
         //  -   `place` is assumed to be sufficiently sized.
         //  -   `place` is assumed to be sufficiently aligned.
-        LargePage::initialize::<C>(place, self.as_owner(), class_size)
+        Some(LargePage::initialize::<C>(place, self.as_owner(), class_size))
     }
 
     //  Internal; Catch a LargePage, and store it locally.
     #[inline(never)]
-    unsafe fn catch_large_page(page: *mut LargePage) {
-        debug_assert!(!page.is_null());
-
+    unsafe fn catch_large_page(page: NonNull<LargePage>) {
         //  Safety:
         //  -   `page` is not null.
-        let large_page = &*page;
+        let large_page = page.as_ref();
 
         let class_size = large_page.class_size();
         let owner = large_page.owner();
@@ -444,7 +446,7 @@ where
 //
 
 //  Manager of Huge Pages.
-struct HugePagesManager<C, P>([HugePagePtr; 64], marker::PhantomData<*const C>, marker::PhantomData<*const P>);
+struct HugePagesManager<C, P>([HugePagePtr; 64], PhantomData<*const C>, PhantomData<*const P>);
 
 impl<C, P> HugePagesManager<C, P> {
     //  Creates a new instance.
@@ -472,26 +474,25 @@ impl<C, P> HugePagesManager<C, P>
     //  -   Assumes that none of the memory allocated by the socket is still in use, with the possible exception of the
     //      memory used by `self`.
     unsafe fn close(&self, owner: *mut (), platform: &P) {
-        let mut self_page: *mut HugePage = ptr::null_mut();
+        let mut self_page: Option<NonNull<HugePage>> = None;
 
         for huge_page in &self.0[..] {
-            let huge_page = huge_page.steal();
+            let huge_page = match huge_page.exchange(None) {
+                None => break,
+                Some(page) => page,
+            };
 
-            if huge_page.is_null() {
-                break;
-            }
+            debug_assert!(owner == huge_page.as_ref().owner());
 
-            debug_assert!(owner == (*huge_page).owner());
-
-            if C::HUGE_PAGE_SIZE.round_down(owner as usize) == (huge_page as usize) {
-                self_page = huge_page;
+            if C::HUGE_PAGE_SIZE.round_down(owner as usize) == (huge_page.as_ptr() as usize) {
+                self_page = Some(huge_page);
                 continue;
             }
 
             Self::deallocate_huge_page(platform, huge_page);
         }
 
-        if !self_page.is_null() {
+        if let Some(self_page) = self_page {
             Self::deallocate_huge_page(platform, self_page);
         }
     }
@@ -500,7 +501,7 @@ impl<C, P> HugePagesManager<C, P>
     //
     //  Returns the minimum of the currently allocated number of pages and `target`.
     fn reserve(&self, target: usize, owner: *mut (), platform: &P) -> usize {
-        let mut fresh_page: *mut HugePage = ptr::null_mut();
+        let mut fresh_page: Option<NonNull<HugePage>> = None;
 
         for (index, huge_page) in self.0.iter().enumerate() {
             //  Filled from the start, reaching this point means that the `target` is achieved.
@@ -508,31 +509,31 @@ impl<C, P> HugePagesManager<C, P>
                 break;
             }
 
-            if !huge_page.load().is_null() {
+            if !huge_page.load().is_none() {
                 continue;
             }
 
             //  Allocate fresh-page if none currently ready.
-            if fresh_page.is_null() {
+            if fresh_page.is_none() {
                 fresh_page = Self::allocate_huge_page(platform, owner);
             }
 
             //  If allocation fails, there's no reason it would succeed later, just stop.
-            if fresh_page.is_null () {
+            if fresh_page.is_none() {
                 return index;
             }
 
             //  If the replacement is successful, null `fresh_page` to indicate it should not be deallocated or reused.
-            if huge_page.replace_null(fresh_page) {
-                fresh_page = ptr::null_mut();
+            if let Ok(_) = huge_page.compare_exchange(None, fresh_page) {
+                fresh_page = None;
             }
         }
 
-        if !fresh_page.is_null() {
+        if let Some(fresh_page) = fresh_page {
             //  Safety:
             //  -   `fresh_page` was allocated by this platform.
             //  -   `fresh_page` is not referenced by anything.
-            unsafe{ Self::deallocate_huge_page(platform, fresh_page) };
+            unsafe { Self::deallocate_huge_page(platform, fresh_page) };
         }
 
         cmp::min(target, self.0.len())
@@ -544,27 +545,26 @@ impl<C, P> HugePagesManager<C, P>
     //
     //  -   Assumes that `layout` is valid, as per `Self::is_valid_layout`.
     #[inline(never)]
-    unsafe fn allocate_large(&self, layout: Layout, owner: *mut (), platform: &P) -> *mut u8 {
+    unsafe fn allocate_large(&self, layout: Layout, owner: *mut (), platform: &P) -> Option<NonNull<u8>> {
         let mut first_null = self.0.len();
 
         //  Check if any existing page can accomodate the request.
         for (index, huge_page) in self.0.iter().enumerate() {
-            let huge_page = huge_page.load();
-
-            //  The array is filled in order, there's none after that.
-            if huge_page.is_null() {
-                first_null = index;
-                break;
-            }
+            let huge_page = match huge_page.load() {
+                None => {
+                    //  The array is filled in order, there's none after that.
+                    first_null = index;
+                    break;
+                },
+                Some(page) => page,
+            };
 
             //  Safety:
             //  -   `huge_page` is not null.
-            let huge_page = &*huge_page;
+            let huge_page = huge_page.as_ref();
 
-            let result = huge_page.allocate(layout);
-
-            if !result.is_null() {
-                return result;
+            if let Some(result) = huge_page.allocate(layout) {
+                return Some(result);
             }
         }
 
@@ -576,51 +576,49 @@ impl<C, P> HugePagesManager<C, P>
         //  None of the non-null pages could accomodate the request, so allocate a fresh one.
         let fresh_page = Self::allocate_huge_page(platform, owner);
 
-        let result = if !fresh_page.is_null() {
-            //  Safety:
-            //  -   `fresh_page` is not null.
-            (&*fresh_page).allocate(layout)
-        } else {
-            ptr::null_mut()
-        };
+        let result = fresh_page.and_then(|page| page.as_ref().allocate(layout));
 
         for huge_page in &self.0[first_null..] {
             //  Spot claimed!
-            if !fresh_page.is_null() && huge_page.replace_null(fresh_page) {
+            if fresh_page.is_some() && huge_page.compare_exchange(None, fresh_page).is_ok() {
                 //  Exclusive access to `fresh_page` at the moment `result` was allocated should guarantee that the
                 //  allocation succeeded.
-                debug_assert!(!result.is_null());
+                debug_assert!(result.is_some());
                 return result;
             }
 
             //  Someone claimed the spot first, or `fresh_page` is null...
             let huge_page = huge_page.load();
 
-            //  Nobody claimed the spot, so `fresh_page` is null, no allocation today!
-            if huge_page.is_null() {
-                debug_assert!(fresh_page.is_null());
-                return ptr::null_mut();
-            }
+            let huge_page = if let Some(huge_page) = huge_page {
+                huge_page
+            } else {
+                //  Nobody claimed the spot, so `fresh_page` is null, no allocation today!
+                debug_assert!(fresh_page.is_none());
+                return None;
+            };
 
             //  Someone claimed the spot, maybe there's room!
 
             //  Safety:
             //  -   `huge_page` is not null.
-            let huge_page = &*huge_page;
-
-            let result = huge_page.allocate(layout);
+            let huge_page = huge_page.as_ref();
 
             //  There is room! Release the newly acquired `fresh_page`, for now.
-            if !result.is_null() {
-                platform.deallocate(fresh_page as *mut u8, Self::HUGE_PAGE_LAYOUT);
-                return result;
+            if let Some(result) = huge_page.allocate(layout) {
+                if let Some(fresh_page) = fresh_page {
+                    platform.deallocate(fresh_page.cast(), Self::HUGE_PAGE_LAYOUT);
+                }
+                return Some(result);
             }
         }
 
         //  The array of huge pages is full. Unexpected, but not a reason to leak!
-        platform.deallocate(fresh_page as *mut u8, Self::HUGE_PAGE_LAYOUT);
+        if let Some(fresh_page) = fresh_page {
+            platform.deallocate(fresh_page.cast(), Self::HUGE_PAGE_LAYOUT);
+        }
 
-        ptr::null_mut()
+        None
     }
 
     //  Deallocates a Large allocation.
@@ -629,31 +627,26 @@ impl<C, P> HugePagesManager<C, P>
     //
     //  -   Assumes that `ptr` is a Large allocation allocated by an instance of `Self`.
     #[inline(never)]
-    unsafe fn deallocate_large(&self, ptr: *mut u8) {
-        debug_assert!((ptr as usize) % C::LARGE_PAGE_SIZE == 0);
-        debug_assert!((ptr as usize) % C::HUGE_PAGE_SIZE != 0);
+    unsafe fn deallocate_large(&self, ptr: NonNull<u8>) {
+        debug_assert!((ptr.as_ptr() as usize) % C::LARGE_PAGE_SIZE == 0);
+        debug_assert!((ptr.as_ptr() as usize) % C::HUGE_PAGE_SIZE != 0);
 
         //  Safety:
         //  -   `ptr` is assumed to be a large allocation within a HugePage.
         let huge_page = HugePage::from_raw::<C>(ptr);
-        debug_assert!(!huge_page.is_null());
 
         //  Safety:
         //  -   `huge_page` is not null.
-        let huge_page = &*huge_page;
+        let huge_page = huge_page.as_ref();
 
         huge_page.deallocate(ptr);
     }
 
     //  Internal; Allocates a HugePage, as defined by C.
-    fn allocate_huge_page(platform: &P, owner: *mut ()) -> *mut HugePage {
+    fn allocate_huge_page(platform: &P, owner: *mut ()) -> Option<NonNull<HugePage>> {
         //  Safety:
         //  -   Layout is correctly formed.
-        let ptr = unsafe { platform.allocate(Self::HUGE_PAGE_LAYOUT) };
-
-        if ptr.is_null() {
-            return ptr::null_mut();
-        }
+        let ptr = unsafe { platform.allocate(Self::HUGE_PAGE_LAYOUT) }?;
 
         debug_assert!(utils::is_sufficiently_aligned_for(ptr, C::HUGE_PAGE_SIZE));
 
@@ -661,12 +654,12 @@ impl<C, P> HugePagesManager<C, P>
         //  -   `ptr` is not null.
         //  -   `ptr` is sufficiently aligned.
         //  -   `C::HUGE_PAGE_SIZE` bytes are assumed to have been allocated.
-        let slice = unsafe { slice::from_raw_parts_mut(ptr, C::HUGE_PAGE_SIZE.value()) };
+        let slice = unsafe { slice::from_raw_parts_mut(ptr.as_ptr(), C::HUGE_PAGE_SIZE.value()) };
     
         //  Safety:
         //  -   The slice is sufficiently large.
         //  -   The slice is sufficiently aligned.
-        unsafe { HugePage::initialize::<C>(slice, owner) }
+        Some(unsafe { HugePage::initialize::<C>(slice, owner) })
     }
 
     //  Internal; Deallocates a HugePage, as defined by C.
@@ -676,12 +669,8 @@ impl<C, P> HugePagesManager<C, P>
     //  #   Safety
     //
     //  -   Assumes that `page` was allocated by this platform.
-    unsafe fn deallocate_huge_page(platform: &P, page: *mut HugePage) {
-        if page.is_null() {
-            return;
-        }
-
-        platform.deallocate(page as *mut u8, Self::HUGE_PAGE_LAYOUT);
+    unsafe fn deallocate_huge_page(platform: &P, page: NonNull<HugePage>) {
+        platform.deallocate(page.cast(), Self::HUGE_PAGE_LAYOUT);
     }
 }
 
@@ -694,13 +683,13 @@ struct ThreadLocalsManager<C> {
     //  Owner.
     owner: *mut (),
     //  Stack of available thread-locals.
-    stack: CellAtomicForeignStack,
+    stack: AtomicBlockForeignStack,
     //  Current watermark for fresh allocations into the buffer area.
     watermark: atomic::AtomicPtr<u8>,
     //  End of buffer area.
-    end: *mut u8,
+    end: NonNull<u8>,
     //  Marker...
-    _configuration: marker::PhantomData<*const C>,
+    _configuration: PhantomData<*const C>,
 }
 
 impl<C> ThreadLocalsManager<C> 
@@ -711,11 +700,11 @@ impl<C> ThreadLocalsManager<C>
 
     //  Creates an instance which will carve-up the memory of `place` into `ThreadLocals`.
     fn new(owner: *mut (), buffer: &mut [u8]) -> Self {
-        let _configuration = marker::PhantomData;
+        let _configuration = PhantomData;
 
         //  Safety:
         //  -   `buffer.len()` is valid if `buffer` is valid.
-        let end = unsafe { buffer.as_mut_ptr().add(buffer.len()) };
+        let end = unsafe { NonNull::new_unchecked(buffer.as_mut_ptr().add(buffer.len())) };
         debug_assert!(utils::is_sufficiently_aligned_for(end, PowerOf2::align_of::<GuardedThreadLocal<C>>()));
 
         let nb_thread_locals = buffer.len() / Self::THREAD_LOCAL_SIZE;
@@ -723,17 +712,17 @@ impl<C> ThreadLocalsManager<C>
 
         //  Safety:
         //  -   `watermark` still points inside `buffer`, as `x / y * y <= x`.
-        let watermark = unsafe { end.sub(nb_thread_locals * Self::THREAD_LOCAL_SIZE) };
+        let watermark = unsafe { end.as_ptr().sub(nb_thread_locals * Self::THREAD_LOCAL_SIZE) };
         let watermark = atomic::AtomicPtr::new(watermark);
 
-        let stack = CellAtomicForeignStack::default();
+        let stack = AtomicBlockForeignStack::default();
 
         Self { owner, stack, watermark, end, _configuration, }
     }
 
     //  Acquires a ThreadLocal, if possible.
-    fn acquire(&self) -> Option<ptr::NonNull<ThreadLocal<C>>> {
-        const RELAXED: atomic::Ordering = atomic::Ordering::Relaxed;
+    fn acquire(&self) -> Option<NonNull<ThreadLocal<C>>> {
+        const RELAXED: Ordering = Ordering::Relaxed;
 
         //  Pick one from stack, if any.
         if let Some(thread_local) = self.pop() {
@@ -741,7 +730,7 @@ impl<C> ThreadLocalsManager<C>
         }
 
         let mut current = self.watermark.load(RELAXED);
-        let end = self.end;
+        let end = self.end.as_ptr();
 
         while current < end {
             //  Safety:
@@ -759,10 +748,14 @@ impl<C> ThreadLocalsManager<C>
             return None;
         }
 
+        //  Safety:
+        //  -   `current` is not null.
+        let current = unsafe { NonNull::new_unchecked(current) };
+
         debug_assert!(utils::is_sufficiently_aligned_for(current, PowerOf2::align_of::<GuardedThreadLocal<C>>()));
 
         #[allow(clippy::cast_ptr_alignment)]
-        let current = current as *mut GuardedThreadLocal<C>;
+        let current = current.as_ptr() as *mut GuardedThreadLocal<C>;
 
         //  Safety:
         //  -   `current` is valid for writes.
@@ -770,21 +763,17 @@ impl<C> ThreadLocalsManager<C>
         unsafe { ptr::write(current, GuardedThreadLocal::new(self.owner)) };
 
         //  Safety:
-        //  -   `current` is exclusive.
-        let guarded = unsafe { &mut *current };
+        //  -   `current` is non null.
+        let guarded = unsafe { &*current };
 
-        let thread_local = &mut guarded.thread_local;
-
-        //  Safety:
-        //  -   `thread_local` is not null.
-        Some(unsafe { ptr::NonNull::new_unchecked(thread_local as *mut _) })
+        Some(NonNull::from(&guarded.thread_local))
     }
 
     //  Releases a ThreadLocal, after use.
-    fn release(&self, thread_local: ptr::NonNull<ThreadLocal<C>>) { self.push(thread_local); }
+    fn release(&self, thread_local: NonNull<ThreadLocal<C>>) { self.push(thread_local); }
 
     //  Internal; Pops a ThreadLocal off the stack, if any.
-    fn pop(&self) -> Option<ptr::NonNull<ThreadLocal<C>>> {
+    fn pop(&self) -> Option<NonNull<ThreadLocal<C>>> {
         self.stack.pop().map(|cell| {
             let thread_local = cell.cast();
             //  Safety:
@@ -796,44 +785,16 @@ impl<C> ThreadLocalsManager<C>
     }
 
     //  Internal; Pushes a ThreadLocal onto the stack.
-    fn push(&self, thread_local: ptr::NonNull<ThreadLocal<C>>) {
+    fn push(&self, thread_local: NonNull<ThreadLocal<C>>) {
         let cell = thread_local.cast();
-        unsafe { ptr::write(cell.as_ptr(), CellAtomicForeign::default()) };
+        unsafe { ptr::write(cell.as_ptr(), AtomicBlockForeign::default()) };
 
         self.stack.push(cell);
     }
 }
 
-impl<C> Default for ThreadLocalsManager<C> {
-    fn default() -> Self {
-        Self {
-            owner: ptr::null_mut(),
-            stack: CellAtomicForeignStack::default(),
-            watermark: atomic::AtomicPtr::new(ptr::null_mut()),
-            end: ptr::null_mut(),
-            _configuration: marker::PhantomData,
-        }
-    }
-}
-
 //  A simple atomic pointer to a `HugePage`.
-struct HugePagePtr(atomic::AtomicPtr<HugePage>);
-
-impl HugePagePtr {
-    fn load(&self) -> *mut HugePage { self.0.load(atomic::Ordering::Acquire) }
-
-    fn replace_null(&self, ptr: *mut HugePage) -> bool {
-        self.0.compare_exchange(ptr::null_mut(), ptr, atomic::Ordering::AcqRel, atomic::Ordering::Relaxed).is_ok()
-    }
-
-    fn steal(&self) -> *mut HugePage { self.0.swap(ptr::null_mut(), atomic::Ordering::AcqRel) }
-
-    fn store(&self, ptr: *mut HugePage) { self.0.store(ptr, atomic::Ordering::Release) }
-}
-
-impl Default for HugePagePtr {
-    fn default() -> Self { Self(atomic::AtomicPtr::new(ptr::null_mut())) }
-}
+type HugePagePtr = AtomicPtr<HugePage>;
 
 //  A simple padding wrapper to avoid false-sharing between `ThreadLocal`.
 #[repr(C)]
@@ -861,7 +822,7 @@ impl<C> Default for GuardedThreadLocal<C>
 #[cfg(test)]
 mod tests {
 
-use core::cell;
+use core::cell::Cell;
 
 use crate::{PowerOf2, Properties};
 
@@ -888,35 +849,30 @@ const HUGE_PAGE_SIZE: usize = TestConfiguration::HUGE_PAGE_SIZE.value();
 const LARGE_PAGE_LAYOUT: Layout = unsafe { Layout::from_size_align_unchecked(LARGE_PAGE_SIZE, LARGE_PAGE_SIZE) };
 const HUGE_PAGE_LAYOUT: Layout = unsafe { Layout::from_size_align_unchecked(HUGE_PAGE_SIZE, HUGE_PAGE_SIZE) };
 
-struct TestPlatform([cell::Cell<*mut u8>; 32]);
+struct TestPlatform([Cell<Option<NonNull<u8>>>; 32]);
 
 impl TestPlatform {
     const HUGE_PAGE_SIZE: usize = TestConfiguration::HUGE_PAGE_SIZE.value();
 
-    //  Stores have to be split to avoid stack overflow in Debug mode.
-    unsafe fn new(first: &HugePageStore, second: &HugePageStore) -> TestPlatform {
-        let stores: [cell::Cell<*mut u8>; 32] = mem::zeroed();
+    unsafe fn new(store: &HugePageStore) -> TestPlatform {
+        let stores: [Cell<Option<NonNull<u8>>>; 32] = Default::default();
 
-        for i in 0..16 {
-            stores[i].set(first.as_ptr().add(i * Self::HUGE_PAGE_SIZE));
-        }
-
-        for i in 0..16 {
-            stores[16 + i].set(second.as_ptr().add(i * Self::HUGE_PAGE_SIZE));
+        for (i, cell) in stores.iter().enumerate() {
+            cell.set(NonNull::new(store.as_ptr().add(i * Self::HUGE_PAGE_SIZE)));
         }
 
         TestPlatform(stores)
     }
 
     //  Creates a TestHugeAllocator.
-    unsafe fn allocator(first: &HugePageStore, second: &HugePageStore) -> TestHugeAllocator {
-        TestHugeAllocator::new(Self::new(first, second))
+    unsafe fn allocator(store: &HugePageStore) -> TestHugeAllocator {
+        TestHugeAllocator::new(Self::new(store))
     }
 
     //  Shrink the number of allocations to at most n.
     fn shrink(&self, n: usize) {
         for ptr in &self.0[n..] {
-            ptr.set(ptr::null_mut());
+            ptr.set(None);
         }
     }
 
@@ -928,7 +884,7 @@ impl TestPlatform {
         loop {
             let large = unsafe { manager.allocate_large(LARGE_PAGE_LAYOUT, owner, &platform) };
 
-            if large.is_null() { break; }
+            if large.is_none() { break; }
         }
     }
 
@@ -936,35 +892,35 @@ impl TestPlatform {
     fn allocated(&self) -> usize { self.0.len() - self.available() }
 
     //  Returns the number of available pages.
-    fn available(&self) -> usize { self.0.iter().filter(|p| !p.get().is_null()).count() }
+    fn available(&self) -> usize { self.0.iter().filter(|p| p.get().is_some()).count() }
 }
 
 impl Platform for TestPlatform {
-    unsafe fn allocate(&self, layout: Layout) -> *mut u8 {
+    unsafe fn allocate(&self, layout: Layout) -> Option<NonNull<u8>> {
         assert_eq!(Self::HUGE_PAGE_SIZE, layout.size());
         assert_eq!(Self::HUGE_PAGE_SIZE, layout.align());
 
         for ptr in &self.0[..] {
-            if ptr.get().is_null() {
+            if ptr.get().is_none() {
                 continue;
             }
 
-            return ptr.replace(ptr::null_mut());
+            return ptr.replace(None);
         }
 
-        ptr::null_mut()
+        None
     }
 
-    unsafe fn deallocate(&self, pointer: *mut u8, layout: Layout) {
+    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
         assert_eq!(Self::HUGE_PAGE_SIZE, layout.size());
         assert_eq!(Self::HUGE_PAGE_SIZE, layout.align());
 
         for ptr in &self.0[..] {
-            if !ptr.get().is_null() {
+            if ptr.get().is_some() {
                 continue;
             }
 
-            ptr.set(pointer);
+            ptr.set(Some(pointer));
             return;
         }
     }
@@ -997,14 +953,23 @@ impl Default for ThreadLocalsStore {
 }
 
 #[repr(align(8192))]
-struct HugePageStore([u8; 131072]); // 128K
+#[derive(Clone, Default)]
+struct HugePageCell(u8);
+
+struct HugePageStore(Vec<HugePageCell>); // 128K
 
 impl HugePageStore {
-    fn as_ptr(&self) -> *mut u8 { self.0[..].as_ptr() as *mut _ }
+    fn as_ptr(&self) -> *mut u8 { self.0.as_ptr() as *const u8 as *mut _ }
 }
 
 impl Default for HugePageStore {
-    fn default() -> Self { unsafe { mem::zeroed() } }
+    fn default() -> Self {
+        let mut vec = vec!();
+        //  256K worth of memory
+        vec.resize(256 * 1024 / mem::size_of::<HugePageCell>(), HugePageCell::default());
+
+        Self(vec)
+    }
 }
 
 #[test]
@@ -1012,13 +977,12 @@ fn thread_locals_manager_new() {
     let store = ThreadLocalsStore::default();
     let manager = unsafe { store.create() };
 
-    let watermark = manager.watermark.load(atomic::Ordering::Relaxed);
+    let watermark = manager.watermark.load(Ordering::Relaxed);
 
     assert_eq!(None, manager.stack.pop());
     assert_ne!(ptr::null_mut(), watermark);
-    assert_ne!(ptr::null_mut(), manager.end);
 
-    let bytes = manager.end as usize - watermark as usize;
+    let bytes = manager.end.as_ptr() as usize - watermark as usize;
 
     assert_eq!(7680, bytes);
     assert_eq!(0, bytes % ThreadLocalsStore::THREAD_LOCAL_SIZE);
@@ -1038,15 +1002,15 @@ fn thread_locals_acquire_release() {
     }
 
     //  Watermark bumped all the way through.
-    let watermark = manager.watermark.load(atomic::Ordering::Relaxed);
-    assert_eq!(manager.end, watermark);
+    let watermark = manager.watermark.load(Ordering::Relaxed);
+    assert_eq!(manager.end.as_ptr(), watermark);
 
     //  No more!
     assert_eq!(None, manager.acquire());
 
     //  Release thread-locals.
     for ptr in &thread_locals {
-        manager.release(ptr::NonNull::new(*ptr).unwrap());
+        manager.release(NonNull::new(*ptr).unwrap());
     }
 
     //  Acquire them again, in reverse order.
@@ -1059,14 +1023,14 @@ fn thread_locals_acquire_release() {
 fn huge_pages_reserve_full() {
     let owner = 0x1234 as *mut ();
 
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let platform = unsafe { TestPlatform::new(&first, &second) };
+    let store = HugePageStore::default();
+    let platform = unsafe { TestPlatform::new(&store) };
 
     //  Created empty.
     let manager = TestHugePagesManager::new();
 
     for page in &manager.0[..] {
-        assert_eq!(ptr::null_mut(), page.load());
+        assert_eq!(None, page.load());
     }
 
     //  Reserve a few pages.
@@ -1076,11 +1040,11 @@ fn huge_pages_reserve_full() {
     assert_eq!(3, platform.allocated());
 
     for page in &manager.0[..3] {
-        assert_ne!(ptr::null_mut(), page.load());
+        assert_ne!(None, page.load());
     }
 
     for page in &manager.0[3..] {
-        assert_eq!(ptr::null_mut(), page.load());
+        assert_eq!(None, page.load());
     }
 
     //  Reserve a few more pages.
@@ -1090,11 +1054,11 @@ fn huge_pages_reserve_full() {
     assert_eq!(5, platform.allocated());
 
     for page in &manager.0[..5] {
-        assert_ne!(ptr::null_mut(), page.load());
+        assert_ne!(None, page.load());
     }
 
     for page in &manager.0[5..] {
-        assert_eq!(ptr::null_mut(), page.load());
+        assert_eq!(None, page.load());
     }
 
     //  Reserve a few _less_ pages.
@@ -1104,11 +1068,11 @@ fn huge_pages_reserve_full() {
     assert_eq!(5, platform.allocated());
 
     for page in &manager.0[..5] {
-        assert_ne!(ptr::null_mut(), page.load());
+        assert_ne!(None, page.load());
     }
 
     for page in &manager.0[5..] {
-        assert_eq!(ptr::null_mut(), page.load());
+        assert_eq!(None, page.load());
     }
 }
 
@@ -1116,14 +1080,14 @@ fn huge_pages_reserve_full() {
 fn huge_pages_reserve_partial() {
     let owner = 0x1234 as *mut ();
 
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let platform = unsafe { TestPlatform::new(&first, &second) };
+    let store = HugePageStore::default();
+    let platform = unsafe { TestPlatform::new(&store) };
 
     //  Created empty.
     let manager = TestHugePagesManager::new();
 
     for page in &manager.0[..] {
-        assert_eq!(ptr::null_mut(), page.load());
+        assert_eq!(None, page.load());
     }
 
     //  Reserve a few pages.
@@ -1133,11 +1097,11 @@ fn huge_pages_reserve_partial() {
     assert_eq!(3, platform.allocated());
 
     for page in &manager.0[..3] {
-        assert_ne!(ptr::null_mut(), page.load());
+        assert_ne!(None, page.load());
     }
 
     for page in &manager.0[3..] {
-        assert_eq!(ptr::null_mut(), page.load());
+        assert_eq!(None, page.load());
     }
 
     //  Clear platform.
@@ -1151,11 +1115,11 @@ fn huge_pages_reserve_partial() {
     assert_eq!(32, platform.allocated());
 
     for page in &manager.0[..4] {
-        assert_ne!(ptr::null_mut(), page.load());
+        assert_ne!(None, page.load());
     }
 
     for page in &manager.0[4..] {
-        assert_eq!(ptr::null_mut(), page.load());
+        assert_eq!(None, page.load());
     }
 }
 
@@ -1163,8 +1127,8 @@ fn huge_pages_reserve_partial() {
 fn huge_pages_close() {
     let owner = 0x1234 as *mut ();
 
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let platform = unsafe { TestPlatform::new(&first, &second) };
+    let store = HugePageStore::default();
+    let platform = unsafe { TestPlatform::new(&store) };
 
     let manager = TestHugePagesManager::new();
 
@@ -1184,16 +1148,16 @@ fn huge_pages_close() {
 fn huge_pages_allocate_initial_fresh() {
     let owner = 0x1234 as *mut ();
 
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let platform = unsafe { TestPlatform::new(&first, &second) };
+    let store = HugePageStore::default();
+    let platform = unsafe { TestPlatform::new(&store) };
 
     let manager = TestHugePagesManager::new();
     let large = unsafe { manager.allocate_large(LARGE_PAGE_LAYOUT, owner, &platform) };
 
     assert_eq!(1, platform.allocated());
 
-    assert_ne!(ptr::null_mut(), manager.0[0].load());
-    assert_ne!(ptr::null_mut(), large);
+    assert_ne!(None, manager.0[0].load());
+    assert_ne!(None, large);
 }
 
 #[test]
@@ -1208,16 +1172,16 @@ fn huge_pages_allocate_initial_out_of_memory() {
     let manager = TestHugePagesManager::new();
     let large = unsafe { manager.allocate_large(LARGE_PAGE_LAYOUT, owner, &platform) };
 
-    assert_eq!(ptr::null_mut(), manager.0[0].load());
-    assert_eq!(ptr::null_mut(), large);
+    assert_eq!(None, manager.0[0].load());
+    assert_eq!(None, large);
 }
 
 #[test]
 fn huge_pages_allocate_primed_reuse() {
     let owner = 0x1234 as *mut ();
 
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let platform = unsafe { TestPlatform::new(&first, &second) };
+    let store = HugePageStore::default();
+    let platform = unsafe { TestPlatform::new(&store) };
 
     //  Create manager with existing pages.
     let manager = TestHugePagesManager::new();
@@ -1230,7 +1194,7 @@ fn huge_pages_allocate_primed_reuse() {
     for _ in 0..reserved {
         let large = unsafe { manager.allocate_large(LARGE_PAGE_LAYOUT, owner, &platform) };
 
-        assert_ne!(ptr::null_mut(), large);
+        assert_ne!(None, large);
     }
 
     //  Without any more allocations.
@@ -1241,8 +1205,8 @@ fn huge_pages_allocate_primed_reuse() {
 fn huge_pages_allocate_primed_fresh() {
     let owner = 0x1234 as *mut ();
 
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let platform = unsafe { TestPlatform::new(&first, &second) };
+    let store = HugePageStore::default();
+    let platform = unsafe { TestPlatform::new(&store) };
 
     //  Create manager with existing pages.
     let manager = TestHugePagesManager::new();
@@ -1257,7 +1221,7 @@ fn huge_pages_allocate_primed_fresh() {
     //  Allocate one more Large Page by creating a new HugePage.
     let large = unsafe { manager.allocate_large(LARGE_PAGE_LAYOUT, owner, &platform) };
 
-    assert_ne!(ptr::null_mut(), large);
+    assert_ne!(None, large);
     assert_eq!(4, platform.allocated());
 }
 
@@ -1265,8 +1229,8 @@ fn huge_pages_allocate_primed_fresh() {
 fn huge_pages_allocate_primed_out_of_memory() {
     let owner = 0x1234 as *mut ();
 
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let platform = unsafe { TestPlatform::new(&first, &second) };
+    let store = HugePageStore::default();
+    let platform = unsafe { TestPlatform::new(&store) };
 
     //  Create manager with existing pages.
     let manager = TestHugePagesManager::new();
@@ -1282,15 +1246,15 @@ fn huge_pages_allocate_primed_out_of_memory() {
     //  Fail to allocate any further.
     let large = unsafe { manager.allocate_large(LARGE_PAGE_LAYOUT, owner, &platform) };
 
-    assert_eq!(ptr::null_mut(), large);
+    assert_eq!(None, large);
 }
 
 #[test]
 fn huge_pages_allocate_full() {
     let owner = 0x1234 as *mut ();
 
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let platform = unsafe { TestPlatform::new(&first, &second) };
+    let store = HugePageStore::default();
+    let platform = unsafe { TestPlatform::new(&store) };
 
     //  Create manager with existing pages.
     let manager = TestHugePagesManager::new();
@@ -1311,7 +1275,7 @@ fn huge_pages_allocate_full() {
     //  Fail to allocate any further.
     let large = unsafe { manager.allocate_large(LARGE_PAGE_LAYOUT, owner, &platform) };
 
-    assert_eq!(ptr::null_mut(), large);
+    assert_eq!(None, large);
 
     //  The HugePage was returned to the platform.
     assert_eq!(1, platform.allocated());
@@ -1321,8 +1285,8 @@ fn huge_pages_allocate_full() {
 fn huge_pages_deallocate() {
     let owner = 0x1234 as *mut ();
 
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let platform = unsafe { TestPlatform::new(&first, &second) };
+    let store = HugePageStore::default();
+    let platform = unsafe { TestPlatform::new(&store) };
 
     //  Create manager with existing pages.
     let manager = TestHugePagesManager::new();
@@ -1330,11 +1294,11 @@ fn huge_pages_deallocate() {
     //  Allocate a page.
     let large = unsafe { manager.allocate_large(LARGE_PAGE_LAYOUT, owner, &platform) };
 
-    assert_ne!(ptr::null_mut(), large);
+    assert_ne!(None, large);
     assert_eq!(1, platform.allocated());
 
     //  Deallocate it.
-    unsafe { manager.deallocate_large(large) };
+    unsafe { manager.deallocate_large(large.unwrap()) };
 
     //  Allocate a page again, it's the same one!
     let other = unsafe { manager.allocate_large(LARGE_PAGE_LAYOUT, owner, &platform) };
@@ -1350,8 +1314,8 @@ fn socket_local_size() {
 
 #[test]
 fn socket_local_boostrap_success() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
 
     let socket = TestSocketLocal::bootstrap(&allocator);
 
@@ -1410,8 +1374,8 @@ fn socket_local_is_valid_layout() {
 
 #[test]
 fn socket_local_reserve() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
 
@@ -1432,8 +1396,8 @@ fn socket_local_reserve() {
 
 #[test]
 fn socket_local_close() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
 
@@ -1451,8 +1415,8 @@ fn socket_local_close() {
 
 #[test]
 fn socket_local_acquire_release_thread_local() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
 
@@ -1467,8 +1431,8 @@ fn socket_local_acquire_release_thread_local() {
 
 #[test]
 fn socket_local_allocate_deallocate_huge() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
 
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
@@ -1479,17 +1443,17 @@ fn socket_local_allocate_deallocate_huge() {
     //  Allocate a huge page.
     let allocation = unsafe { socket.allocate(thread_local, HUGE_PAGE_LAYOUT) };
 
-    assert_ne!(ptr::null_mut(), allocation);
+    assert_ne!(None, allocation);
     assert_eq!(2, allocator.platform().allocated());
 
     //  Deallocate the huge page.
-    unsafe { socket.deallocate(thread_local, allocation) };
+    unsafe { socket.deallocate(thread_local, allocation.unwrap()) };
 }
 
 #[test]
 fn socket_local_allocate_huge_failure() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
 
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
@@ -1503,13 +1467,13 @@ fn socket_local_allocate_huge_failure() {
 
     //  Allocate a huge page.
     let allocation = unsafe { socket.allocate(thread_local, HUGE_PAGE_LAYOUT) };
-    assert_eq!(ptr::null_mut(), allocation);
+    assert_eq!(None, allocation);
 }
 
 #[test]
 fn socket_local_allocate_deallocate_large() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
 
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
@@ -1520,17 +1484,17 @@ fn socket_local_allocate_deallocate_large() {
     //  Allocate a large page.
     let allocation = unsafe { socket.allocate(thread_local, LARGE_PAGE_LAYOUT) };
 
-    assert_ne!(ptr::null_mut(), allocation);
+    assert_ne!(None, allocation);
     assert_eq!(1, allocator.platform().allocated());
 
     //  Deallocate the large page.
-    unsafe { socket.deallocate(thread_local, allocation) };
+    unsafe { socket.deallocate(thread_local, allocation.unwrap()) };
 }
 
 #[test]
 fn socket_local_allocate_large_failure() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
 
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
@@ -1547,13 +1511,13 @@ fn socket_local_allocate_large_failure() {
     //  Allocate a large page.
     let allocation = unsafe { socket.allocate(thread_local, LARGE_PAGE_LAYOUT) };
 
-    assert_eq!(ptr::null_mut(), allocation);
+    assert_eq!(None, allocation);
 }
 
 #[test]
 fn socket_local_allocate_deallocate_normal() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
 
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
@@ -1565,17 +1529,17 @@ fn socket_local_allocate_deallocate_normal() {
     let layout = Layout::from_size_align(1, 1).unwrap();
     let allocation = unsafe { socket.allocate(thread_local, layout) };
 
-    assert_ne!(ptr::null_mut(), allocation);
+    assert_ne!(None, allocation);
     assert_eq!(1, allocator.platform().allocated());
 
     //  Deallocate the piece.
-    unsafe { socket.deallocate(thread_local, allocation) };
+    unsafe { socket.deallocate(thread_local, allocation.unwrap()) };
 }
 
 #[test]
 fn socket_local_allocate_normal_failure() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
 
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
@@ -1593,13 +1557,13 @@ fn socket_local_allocate_normal_failure() {
     let layout = Layout::from_size_align(1, 1).unwrap();
     let allocation = unsafe { socket.allocate(thread_local, layout) };
 
-    assert_eq!(ptr::null_mut(), allocation);
+    assert_eq!(None, allocation);
 }
 
 #[test]
 fn socket_local_allocate_deallocate_normal_catch() {
-    let (first, second) = (HugePageStore::default(), HugePageStore::default());
-    let allocator = unsafe { TestPlatform::allocator(&first, &second) };
+    let store = HugePageStore::default();
+    let allocator = unsafe { TestPlatform::allocator(&store) };
 
     let socket = TestSocketLocal::bootstrap(&allocator).unwrap();
     let socket = unsafe { socket.as_ref() };
@@ -1621,21 +1585,21 @@ fn socket_local_allocate_deallocate_normal_catch() {
         unsafe { socket.allocate(thread_local, layout) },
     ];
 
-    assert_ne!(ptr::null_mut(), allocations[0]);
-    assert_ne!(ptr::null_mut(), allocations[1]);
+    assert_ne!(None, allocations[0]);
+    assert_ne!(None, allocations[1]);
 
     //  No further allocation is possible.
     let further = unsafe { socket.allocate(thread_local, layout) };
-    assert_eq!(ptr::null_mut(), further);
+    assert_eq!(None, further);
 
     //  Deallocate 1 of the two allocations, the LargePage should be caught.
-    unsafe { socket.deallocate(thread_local, allocations[0]) };
+    unsafe { socket.deallocate(thread_local, allocations[0].unwrap()) };
 
-    assert_ne!(ptr::null_mut(), unsafe { socket.large_pages[class_size.value()].peek() });
+    assert_ne!(None, unsafe { socket.large_pages[class_size.value()].peek() });
 
     //  Further allocation is now possible!
     let further = unsafe { socket.allocate(thread_local, layout) };
-    assert_ne!(ptr::null_mut(), further);
+    assert_ne!(None, further);
 }
 
 }

@@ -2,10 +2,17 @@
 //!
 //! A ThreadLocal instance is a thread-local cache used to speed up Normal allocations.
 
-use core::{marker, mem, ptr};
+use core::{
+    marker,
+    mem,
+    ptr::{self, NonNull},
+};
 
 use crate::{ClassSize, Configuration};
-use crate::internals::{cells, large_page::LargePage};
+use crate::internals::{
+    blocks::{BlockForeign, BlockForeignList, BlockPtr},
+    large_page::LargePage,
+};
 
 /// ThreadLocal
 ///
@@ -17,7 +24,7 @@ pub(crate) struct ThreadLocal<C> {
     //  Locally cached pages, 1 per class-size.
     local_pages: [LargePagePtr; 63],
     //  Foreign allocations, temporarily stored here to minimize touching another thread's cache lines.
-    foreign_allocations: [cells::CellForeignList; 8],
+    foreign_allocations: [BlockForeignList; 8],
     _configuration: marker::PhantomData<C>,
 }
 
@@ -44,37 +51,31 @@ impl<C> ThreadLocal<C>
     /// Flushes all the memory retained by the current instance.
     pub(crate) fn flush<F>(&self, mut recycler: F)
         where
-            F: FnMut(*mut LargePage)
+            F: FnMut(NonNull<LargePage>)
     {
         //  The order in which the pages and foreign allocations are returned is inconsequential as it is guaranteed
         //  that the foreign allocations do not belong to the local pages.
 
         for local_page in &self.local_pages[..] {
-            let local_page = local_page.replace_with_null();
-
-            if local_page.is_null() {
-                continue;
+            if let Some(local_page) = local_page.replace_with_null() {
+                recycler(local_page);
             }
-
-            recycler(local_page);
         }
 
         for foreign_list in &self.foreign_allocations {
-            if foreign_list.is_empty() {
-                continue;
-            }
-
-            let head = foreign_list.head();
-            debug_assert!(!head.is_null());
+            let head = if let Some(head) = foreign_list.head() {
+                head
+            } else {
+                continue
+            };
 
             //  Safety:
             //  -   `head` is assumed to belong to a `LargePage`.
-            let page = unsafe { LargePage::from_raw::<C>(head as *mut u8) };
-            debug_assert!(!page.is_null());
+            let page = unsafe { LargePage::from_raw::<C>(head.cast()) };
 
             //  Safety:
             //  -   `page` is not null.
-            let large_page = unsafe { &*page };
+            let large_page = unsafe { page.as_ref() };
 
             //  Safety:
             //  -   The access to `foreign_list` is exclusive.
@@ -92,9 +93,9 @@ impl<C> ThreadLocal<C>
     ///
     /// -   Assumes that `self` is not concurrently accessed by another thread.
     /// -   Assumes that `class_size` is within bounds.
-    pub(crate) unsafe fn allocate<F>(&self, class_size: ClassSize, provider: F) -> *mut u8
+    pub(crate) unsafe fn allocate<F>(&self, class_size: ClassSize, provider: F) -> Option<NonNull<u8>>
         where
-            F: FnOnce(ClassSize) -> *mut LargePage
+            F: FnOnce(ClassSize) -> Option<NonNull<LargePage>>
     {
         debug_assert!(class_size.value() < self.local_pages.len());
 
@@ -103,16 +104,16 @@ impl<C> ThreadLocal<C>
         let page = self.local_pages.get_unchecked(class_size.value());
 
         //  Fast Path.
-        if !page.get().is_null() {
+        if let Some(large_page) = page.get() {
             //  Safety:
             //  -   `page` is not null.
-            let large_page = &*page.get();
+            let large_page = large_page.as_ref();
 
             //  Safety:
             //  -   It is assumed that this function is never called from multiple threads concurrently.
             let result = large_page.allocate();
 
-            if !result.is_null() {
+            if !result.is_none() {
                 return result;
             }
 
@@ -133,20 +134,17 @@ impl<C> ThreadLocal<C>
     /// -   Assumes that `self` is not concurrently accessed by another thread.
     /// -   Assumes that the `ptr` points to memory that is no longer in use.
     /// -   Assumes that `ptr` belongs to a `LargePage`.
-    pub(crate) unsafe fn deallocate<F>(&self, ptr: *mut u8, recycler: F)
+    pub(crate) unsafe fn deallocate<F>(&self, ptr: NonNull<u8>, recycler: F)
         where
-            F: FnMut(*mut LargePage)
+            F: FnMut(NonNull<LargePage>)
     {
-        debug_assert!(!ptr.is_null());
-
         //  Safety:
         //  -   `ptr` is assumed to belong to a `LargePage`.
         let page = LargePage::from_raw::<C>(ptr);
-        debug_assert!(!page.is_null());
 
         //  Safety:
         //  -   `page` is not null.
-        let large_page = &*page;
+        let large_page = page.as_ref();
 
         let class_size = large_page.class_size();
 
@@ -155,7 +153,7 @@ impl<C> ThreadLocal<C>
         let local_page = self.local_pages.get_unchecked(class_size.value());
 
         //  Fast Path.
-        if local_page.get() == page {
+        if local_page.get() == Some(page) {
             //  Safety:
             //  -   A single thread is assumed to be calling `deallocate` at a time.
             //  -   `ptr` is assumed to point to memory that is no longer in use.
@@ -177,20 +175,18 @@ impl<C> ThreadLocal<C>
     /// -   Assumes that `self` is not concurrently accessed by another thread.
     //  -   Assumes that `class_size` is within bounds.
     #[inline(never)]
-    unsafe fn slow_allocate<F>(&self, page: &LargePagePtr, class_size: ClassSize, provider: F) -> *mut u8
+    unsafe fn slow_allocate<F>(&self, page: &LargePagePtr, class_size: ClassSize, provider: F) -> Option<NonNull<u8>>
         where
-            F: FnOnce(ClassSize) -> *mut LargePage
+            F: FnOnce(ClassSize) -> Option<NonNull<LargePage>>
     {
         page.set(provider(class_size));
 
         //  The provider could not provide a page, it is now someone else's problem.
-        if page.get().is_null() {
-            return ptr::null_mut();
-        }
+        let page = page.get()?;
 
         //  Safety:
         //  -   `page` is not null.
-        let large_page = &*page.get();
+        let large_page = page.as_ref();
 
         //  Some of the so-called `foreign_allocations` may actually be local allocations now!
         for foreign_list in &self.foreign_allocations {
@@ -217,23 +213,21 @@ impl<C> ThreadLocal<C>
     /// -   Assumes that `self` is not concurrently accessed by another thread.
     //  -   Assumes that the `ptr` points to memory that is no longer in use.
     //  -   Assumes that `ptr` belongs to `page`.
-    unsafe fn foreign_deallocate<F>(&self, ptr: *mut u8, page: *mut LargePage, mut recycler: F)
+    unsafe fn foreign_deallocate<F>(&self, ptr: NonNull<u8>, page: NonNull<LargePage>, mut recycler: F)
         where
-            F: FnMut(*mut LargePage)
+            F: FnMut(NonNull<LargePage>)
     {
-        debug_assert!(!ptr.is_null());
-        debug_assert!(!page.is_null());
-        debug_assert!(C::LARGE_PAGE_SIZE.round_down(ptr as usize) == C::LARGE_PAGE_SIZE.round_down(page as usize));
+        debug_assert!(C::LARGE_PAGE_SIZE.round_down(ptr.as_ptr() as usize) == C::LARGE_PAGE_SIZE.round_down(page.as_ptr() as usize));
 
         //  Safety:
         //  -   `page` is not null.
-        let large_page = &*page;
+        let large_page = page.as_ref();
 
         //  Safety:
         //  -   `ptr` is assumed to point to memory that is no longer in use.
         //  -   `ptr` is assumed to point to a sufficiently large memory area.
         //  -   `ptr` is assumed to be correctly aligned.
-        let cell = cells::CellForeign::initialize(ptr);
+        let block = BlockForeign::initialize(ptr);
 
         //  Short-circuit implementation.
         //
@@ -241,25 +235,25 @@ impl<C> ThreadLocal<C>
         //  -   Look for a list to the same page, there will be none.
         //  -   Evict a list to another page prematurely, it'll be a waste.
         if large_page.flush_threshold() == 1 {
-            let foreign_list = cells::CellForeignList::default();
-            Self::push(cell, &foreign_list, large_page, &mut recycler);
+            let foreign_list = BlockForeignList::default();
+            Self::push(block, &foreign_list, large_page, &mut recycler);
             return;
         }
 
         //  Scan for existing list.
         //
-        //  There may be "holes", due to flushes, but it still is desirable to aggregate all cells of a given page
+        //  There may be "holes", due to flushes, but it still is desirable to aggregate all blocks of a given page
         //  together in a single list.
         for foreign_list in &self.foreign_allocations {
             if foreign_list.is_empty() {
                 continue;
             }
 
-            if !foreign_list.is_compatible::<C>(cell) {
+            if !foreign_list.is_compatible::<C>(block) {
                 continue;
             }
 
-            Self::push(cell, foreign_list, large_page, &mut recycler);
+            Self::push(block, foreign_list, large_page, &mut recycler);
             return;
         }
 
@@ -285,20 +279,20 @@ impl<C> ThreadLocal<C>
 
         //  Non-empty list selected, and therefore incompatible; flush it.
         if selected_score != usize::MAX {
-            let head = foreign_list.head();
-            debug_assert!(!head.is_null());
+            if let Some(head) = foreign_list.head() {
+                //  Safety:
+                //  -   `head` is assumed to belong to a `LargePage`.
+                let page = LargePage::from_raw::<C>(head.cast());
 
-            //  Safety:
-            //  -   `head` is assumed to belong to a `LargePage`.
-            let page = LargePage::from_raw::<C>(head as *mut u8);
-            debug_assert!(!page.is_null());
-
-            //  Safety:
-            //  -   `page` is not null.
-            (*page).refill_foreign(foreign_list, &mut recycler);
+                //  Safety:
+                //  -   `page` is not null.
+                page.as_ref().refill_foreign(foreign_list, &mut recycler);
+            } else {
+                debug_assert!(false, "How is the selected list empty if its score is not MAX?")
+            }
         }
 
-        Self::push(cell, foreign_list, large_page, &mut recycler);
+        Self::push(block, foreign_list, large_page, &mut recycler);
     }
 
     //  Internal; Pushes a cell into a foreign-list, possibly refilling the page.
@@ -312,13 +306,13 @@ impl<C> ThreadLocal<C>
     //  -   Assumes that `cell` is compatible with `foreign_list`.
     //  -   Assumes that `cell` belongs to `large_page`.
     unsafe fn push<F>(
-        cell: ptr::NonNull<cells::CellForeign>,
-        foreign_list: &cells::CellForeignList,
+        cell: NonNull<BlockForeign>,
+        foreign_list: &BlockForeignList,
         large_page: &LargePage,
         recycler: F,
     )
         where
-            F: FnMut(*mut LargePage)
+            F: FnMut(NonNull<LargePage>)
     {
         debug_assert!(foreign_list.is_compatible::<C>(cell));
         debug_assert!(C::LARGE_PAGE_SIZE.round_down(cell.as_ptr() as usize)
@@ -349,7 +343,7 @@ impl<C> Default for ThreadLocal<C>
 //  Implementation Details
 //
 
-type LargePagePtr = cells::CellPtr<LargePage>;
+type LargePagePtr = BlockPtr<LargePage>;
 
 #[cfg(test)]
 mod tests {
@@ -375,7 +369,7 @@ struct HugePageStore([usize; 16384]);
 
 impl HugePageStore {
     /// Creates a Recycler, which will memorize the recycled pages.
-    fn recycler<'a>(&'a self, recycled: &'a mut [usize]) -> impl FnMut(*mut LargePage) + 'a {
+    fn recycler<'a>(&'a self, recycled: &'a mut [usize]) -> impl FnMut(NonNull<LargePage>) + 'a {
         let mut i = 0;
         move |large_page| {
             let r = unsafe { self.recycle(large_page) };
@@ -389,7 +383,7 @@ impl HugePageStore {
     /// #   Safety
     ///
     /// -   `i` is assumed to be unoccupied.
-    unsafe fn provide(&self, i: usize, class_size: ClassSize) -> *mut LargePage {
+    unsafe fn provide(&self, i: usize, class_size: ClassSize) -> NonNull<LargePage> {
         let owner = self.address();
         let place = self.place(i);
         LargePage::initialize::<TestConfiguration>(place, owner, class_size)
@@ -400,22 +394,22 @@ impl HugePageStore {
     /// #   Safety
     ///
     /// -   `page` is assumed to be unused after this call.
-    unsafe fn recycle(&self, page: *mut LargePage) -> usize {
+    unsafe fn recycle(&self, page: NonNull<LargePage>) -> usize {
         let address = self.address() as usize;
 
-        assert!(address < page as usize, "{} >= {}", address, page as usize);
-        assert!((page as usize) < address + Self::huge_page_size(),
-            "{} >= {}", page as usize, address + Self::huge_page_size());
+        assert!(address < page.as_ptr() as usize, "{} >= {}", address, page.as_ptr() as usize);
+        assert!((page.as_ptr() as usize) < address + Self::huge_page_size(),
+            "{} >= {}", page.as_ptr() as usize, address + Self::huge_page_size());
 
-        let offset = page as usize - self.address() as usize;
+        let offset = page.as_ptr() as usize - self.address() as usize;
         assert!(offset % Self::large_page_size() == 0, "{} % {} != 0", offset, Self::large_page_size());
 
-        let owner = (*page).owner() as usize;
+        let owner = page.as_ref().owner() as usize;
         assert!(owner == self.address() as usize, "{} != {}", owner, self.address() as usize);
 
         //  Erase any information, which should trip up any test where the page is used afterwards.
         //  It should also catch any case of the same page being returned multiple times, by modifying the owner field.
-        ptr::write_bytes(page as *mut u8, 0xfe, Self::large_page_size());
+        ptr::write_bytes(page.as_ptr() as *mut u8, 0xfe, Self::large_page_size());
 
         offset / Self::large_page_size()
     }
@@ -427,18 +421,18 @@ impl HugePageStore {
         let scratch = self.provide(scratch, class_size);
 
         //  Count how many cells can be allocated by a given page.
-        let number_cells = self.cast_adrift(&*scratch);
+        let number_cells = self.cast_adrift(scratch.as_ref());
 
         //  Exaust `second_page`, stopping short of triggering the null allocation.
         for _ in 0..number_cells {
-            assert_ne!(ptr::null_mut(), page.allocate());
+            assert_ne!(None, page.allocate());
         }
     }
 
     /// Casts a page adrift, by exhausting it. Returns the number of allocations performed.
     unsafe fn cast_adrift(&self, page: &LargePage) -> usize {
         let mut number_cells = 0;
-        while !page.allocate().is_null() { number_cells += 1 }
+        while !page.allocate().is_none() { number_cells += 1 }
         number_cells
     }
 
@@ -467,17 +461,18 @@ impl HugePageStore {
     /// #   Safety
     ///
     /// -   A `LargePage` is assumed to exist at this index.
-    unsafe fn create_foreign_list(&self, i: usize, n: usize) -> cells::CellForeignList {
-        let page = &*self.get_large_page(i);
+    unsafe fn create_foreign_list(&self, i: usize, n: usize) -> BlockForeignList {
+        let page = self.get_large_page(i);
+        let page = page.as_ref();
 
         assert_eq!(page.owner() as usize, self.address() as usize,
             "{} != {}: no LargePage at {}", page.owner() as usize, self.address() as usize, i);
 
-        let list = cells::CellForeignList::default();
+        let list = BlockForeignList::default();
 
         for _ in 0..n {
             let cell_address = page.allocate();
-            let cell = ptr::NonNull::new(cell_address as *mut cells::CellForeign).unwrap();
+            let cell = cell_address.unwrap().cast();
             list.push(cell);
         }
 
@@ -485,19 +480,19 @@ impl HugePageStore {
     }
 
     /// Returns a pointer to the LargePage at the specified index, it may not be initialized.
-    fn get_large_page(&self, index: usize) -> *mut LargePage {
+    fn get_large_page(&self, index: usize) -> NonNull<LargePage> {
         assert!(index != 0);
         assert!(index < Self::number_large_pages(), "{} is too large", index);
 
         let base = self.address() as *mut u8;
         let place = unsafe { base.add(index * Self::large_page_size()) };
 
-        place as *mut LargePage
+        NonNull::new(place as *mut LargePage).expect("Non-null place")
     }
 
     //  Internal; creates a `place` to initialize a `LargePage` in.
     unsafe fn place(&self, index: usize) -> &mut [u8] {
-        let place = self.get_large_page(index) as *mut u8;
+        let place = self.get_large_page(index).as_ptr() as *mut u8;
 
         slice::from_raw_parts_mut(place, Self::large_page_size())
     }
@@ -542,7 +537,8 @@ fn flush() {
 
     let mut thread_local = TestThreadLocal::default();
 
-    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(unsafe { store.provide(LOCAL_PAGE, CLASS_SIZE) });
+    thread_local.local_pages[CLASS_SIZE.value()] =
+        LargePagePtr::new(Some(unsafe { store.provide(LOCAL_PAGE, CLASS_SIZE) }));
 
     unsafe { store.provide(FOREIGN_PAGE, ClassSize::new(5)) };
     thread_local.foreign_allocations[2] = unsafe { store.create_foreign_list(FOREIGN_PAGE, 3) };
@@ -554,7 +550,7 @@ fn flush() {
 
     for (index, local_page) in thread_local.local_pages.iter().enumerate() {
         let local_page = local_page.get();
-        assert!(local_page.is_null(), "Page at {} is not null!", index);
+        assert!(local_page.is_none(), "Page at {} is not null!", index);
     }
 
     for (index, foreign_list) in thread_local.foreign_allocations.iter().enumerate() {
@@ -572,13 +568,13 @@ fn allocate_fast() {
 
     let mut thread_local = TestThreadLocal::default();
 
-    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(local_page);
+    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(Some(local_page));
 
     let p = unsafe { thread_local.allocate(CLASS_SIZE, |_| panic!("No provider!")) };
-    assert_ne!(ptr::null_mut(), p);
+    assert_ne!(None, p);
 
     //  In debug, throws if `p` doesn't belong to `local_page`.
-    unsafe { (*local_page).deallocate(p) };
+    unsafe { local_page.as_ref().deallocate(p.unwrap()) };
 }
 
 #[test]
@@ -594,22 +590,22 @@ fn allocate_slow_initial() {
     let p = unsafe {
         thread_local.allocate(CLASS_SIZE, |class_size| {
             assert_eq!(class_size, CLASS_SIZE);
-            local_page
-        }) 
+            Some(local_page)
+        })
     };
-    assert_ne!(ptr::null_mut(), p);
+    assert_ne!(None, p);
 
     //  In debug, throws if `p` doesn't belong to `local_page`.
-    unsafe { (*local_page).deallocate(p) };
+    unsafe { local_page.as_ref().deallocate(p.unwrap()) };
 
     for (index, page) in thread_local.local_pages.iter().enumerate() {
         let page = page.get();
 
         if index == CLASS_SIZE.value() {
-            assert!(!page.is_null(), "Page at {} is null!", index);
-            assert_eq!(local_page as usize, page as usize);
+            assert!(!page.is_none(), "Page at {} is null!", index);
+            assert_eq!(local_page.as_ptr() as usize, page.unwrap().as_ptr() as usize);
         } else {
-            assert!(page.is_null(), "Page at {} is not null!", index);
+            assert!(page.is_none(), "Page at {} is not null!", index);
         }
     }
 }
@@ -621,13 +617,13 @@ fn allocate_slow_initial_provider_exhausted() {
     let thread_local = TestThreadLocal::default();
 
     //  Attempt to allocate from a null page, triggering a change of page.
-    let p = unsafe { thread_local.allocate(CLASS_SIZE, |_| { ptr::null_mut() }) };
-    assert_eq!(ptr::null_mut(), p);
+    let p = unsafe { thread_local.allocate(CLASS_SIZE, |_| { None }) };
+    assert_eq!(None, p);
 
     for (index, page) in thread_local.local_pages.iter().enumerate() {
         let page = page.get();
 
-        assert!(page.is_null(), "Page at {} is not null!", index);
+        assert!(page.is_none(), "Page at {} is not null!", index);
     }
 }
 
@@ -643,31 +639,31 @@ fn allocate_slow_exhausted() {
     let third_page = unsafe { store.provide(THIRD_PAGE, CLASS_SIZE) };
 
     //  Exaused `second_page`, stopping short of triggering the null allocation.
-    unsafe { store.exhaust(&*second_page, FIRST_PAGE) };
+    unsafe { store.exhaust(second_page.as_ref(), FIRST_PAGE) };
 
     let mut thread_local = TestThreadLocal::default();
-    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(second_page);
+    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(Some(second_page));
 
     //  Attempt to allocate from an empty page, triggering a change of page.
     let p = unsafe {
         thread_local.allocate(CLASS_SIZE, |class_size| {
             assert_eq!(class_size, CLASS_SIZE);
-            third_page
+            Some(third_page)
         })
     };
-    assert_ne!(ptr::null_mut(), p);
+    assert_ne!(None, p);
 
     //  In debug, throws if `p` doesn't belong to `third_page`.
-    unsafe { (*third_page).deallocate(p) };
+    unsafe { third_page.as_ref().deallocate(p.unwrap()) };
 
     for (index, page) in thread_local.local_pages.iter().enumerate() {
         let page = page.get();
 
         if index == CLASS_SIZE.value() {
-            assert!(!page.is_null(), "Page at {} is null!", index);
-            assert_eq!(third_page as usize, page as usize);
+            assert!(!page.is_none(), "Page at {} is null!", index);
+            assert_eq!(third_page.as_ptr() as usize, page.unwrap().as_ptr() as usize);
         } else {
-            assert!(page.is_null(), "Page at {} is not null!", index);
+            assert!(page.is_none(), "Page at {} is not null!", index);
         }
     }
 }
@@ -682,19 +678,19 @@ fn allocate_slow_exhausted_provider_exhausted() {
     let second_page = unsafe { store.provide(SECOND_PAGE, CLASS_SIZE) };
 
     //  Exaused `second_page`, stopping short of triggering the null allocation.
-    unsafe { store.exhaust(&*second_page, FIRST_PAGE) };
+    unsafe { store.exhaust(second_page.as_ref(), FIRST_PAGE) };
 
     let mut thread_local = TestThreadLocal::default();
-    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(second_page);
+    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(Some(second_page));
 
     //  Attempt to allocate from an empty page, triggering a change of page.
-    let p = unsafe { thread_local.allocate(CLASS_SIZE, |_| { ptr::null_mut() }) };
-    assert_eq!(ptr::null_mut(), p);
+    let p = unsafe { thread_local.allocate(CLASS_SIZE, |_| { None }) };
+    assert_eq!(None, p);
 
     for (index, page) in thread_local.local_pages.iter().enumerate() {
         let page = page.get();
 
-        assert!(page.is_null(), "Page at {} is not null!", index);
+        assert!(page.is_none(), "Page at {} is not null!", index);
     }
 }
 
@@ -712,13 +708,13 @@ fn allocate_slow_exhausted_recover_foreign() {
     let third_page = unsafe { store.provide(THIRD_PAGE, CLASS_SIZE) };
 
     //  Exaused `second_page`, stopping short of triggering the null allocation.
-    unsafe { store.exhaust(&*second_page, FIRST_PAGE) };
+    unsafe { store.exhaust(second_page.as_ref(), FIRST_PAGE) };
 
     let mut thread_local = TestThreadLocal::default();
-    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(second_page);
+    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(Some(second_page));
 
     thread_local.foreign_allocations[FOREIGN_LIST] = unsafe { store.create_foreign_list(THIRD_PAGE, 3) };
-    let head = thread_local.foreign_allocations[FOREIGN_LIST].head() as *mut u8;
+    let head = thread_local.foreign_allocations[FOREIGN_LIST].head().map(NonNull::cast);
 
     unsafe {
         let bound = FOREIGN_LIST + 1;
@@ -733,22 +729,22 @@ fn allocate_slow_exhausted_recover_foreign() {
     let p = unsafe {
         thread_local.allocate(CLASS_SIZE, |class_size| {
             assert_eq!(class_size, CLASS_SIZE);
-            third_page
+            Some(third_page)
         })
     };
     assert_eq!(head, p);
 
     //  In debug, throws if `p` doesn't belong to `third_page`.
-    unsafe { (*third_page).deallocate(p) };
+    unsafe { third_page.as_ref().deallocate(p.unwrap()) };
 
     for (index, page) in thread_local.local_pages.iter().enumerate() {
         let page = page.get();
 
         if index == CLASS_SIZE.value() {
-            assert!(!page.is_null(), "Page at {} is null!", index);
-            assert_eq!(third_page as usize, page as usize);
+            assert!(!page.is_none(), "Page at {} is null!", index);
+            assert_eq!(third_page.as_ptr() as usize, page.unwrap().as_ptr() as usize);
         } else {
-            assert!(page.is_null(), "Page at {} is not null!", index);
+            assert!(page.is_none(), "Page at {} is not null!", index);
         }
     }
 
@@ -770,12 +766,12 @@ fn deallocate_local() {
     let local_page = unsafe { store.provide(LOCAL_PAGE, CLASS_SIZE) };
 
     let mut thread_local = TestThreadLocal::default();
-    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(local_page);
+    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(Some(local_page));
 
     let p = unsafe { thread_local.allocate(CLASS_SIZE, |_| panic!("No provider!")) };
-    assert_ne!(ptr::null_mut(), p);
+    assert_ne!(None, p);
 
-    unsafe { thread_local.deallocate(p, |_| panic!("No recycler!")) };
+    unsafe { thread_local.deallocate(p.unwrap(), |_| panic!("No recycler!")) };
 
     //  Immediately reusable!
     let q = unsafe { thread_local.allocate(CLASS_SIZE, |_| panic!("No provider!")) };
@@ -790,22 +786,22 @@ fn deallocate_foreign_no_local() {
     let store = HugePageStore::default();
     let foreign_page = unsafe { store.provide(FOREIGN_PAGE, CLASS_SIZE) };
 
-    let flush_threshold = unsafe { (*foreign_page).flush_threshold() };
+    let flush_threshold = unsafe { foreign_page.as_ref().flush_threshold() };
     assert!(flush_threshold > 5, "{} <= 5", flush_threshold);
 
     let thread_local = TestThreadLocal::default();
 
-    let mut allocated = [ptr::null_mut(); 5];
+    let mut allocated = [None; 5];
     for p in &mut allocated {
-        *p = unsafe { (*foreign_page).allocate() };
+        *p = unsafe { foreign_page.as_ref().allocate() };
     }
 
     for p in &allocated {
-        unsafe { thread_local.deallocate(*p, |_| panic!("No recycler!")) };
+        unsafe { thread_local.deallocate(p.unwrap(), |_| panic!("No recycler!")) };
     }
 
     assert_eq!(allocated.len(), thread_local.foreign_allocations[0].len());
-    assert_eq!(allocated[4], thread_local.foreign_allocations[0].head() as *mut u8);
+    assert_eq!(allocated[4], thread_local.foreign_allocations[0].head().map(NonNull::cast));
 }
 
 #[test]
@@ -819,19 +815,19 @@ fn deallocate_foreign_with_local() {
     let foreign_page = unsafe { store.provide(FOREIGN_PAGE, CLASS_SIZE) };
 
     let mut thread_local = TestThreadLocal::default();
-    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(local_page);
+    thread_local.local_pages[CLASS_SIZE.value()] = LargePagePtr::new(Some(local_page));
 
-    let mut allocated = [ptr::null_mut(); 5];
+    let mut allocated = [None; 5];
     for p in &mut allocated {
-        *p = unsafe { (*foreign_page).allocate() };
+        *p = unsafe { foreign_page.as_ref().allocate() };
     }
 
     for p in &allocated {
-        unsafe { thread_local.deallocate(*p, |_| panic!("No recycler!")) };
+        unsafe { thread_local.deallocate(p.unwrap(), |_| panic!("No recycler!")) };
     }
 
     assert_eq!(allocated.len(), thread_local.foreign_allocations[0].len());
-    assert_eq!(allocated[4], thread_local.foreign_allocations[0].head() as *mut u8);
+    assert_eq!(allocated[4], thread_local.foreign_allocations[0].head().map(NonNull::cast));
 }
 
 #[test]
@@ -843,23 +839,23 @@ fn deallocate_foreign_recycle_immediate() {
     let store = HugePageStore::default();
     let foreign_page = unsafe { store.provide(FOREIGN_PAGE, CLASS_SIZE) };
 
-    assert_eq!(FLUSH_TRESHOLD, unsafe { (*foreign_page).flush_threshold() });
+    assert_eq!(FLUSH_TRESHOLD, unsafe { foreign_page.as_ref().flush_threshold() });
 
-    let mut allocated = [ptr::null_mut(); FLUSH_TRESHOLD];
+    let mut allocated = [None; FLUSH_TRESHOLD];
     for p in &mut allocated {
-        *p = unsafe { (*foreign_page).allocate() };
-        assert_ne!(ptr::null_mut(), *p);
+        *p = unsafe { foreign_page.as_ref().allocate() };
+        assert_ne!(None, *p);
     }
 
     //  Cast the page adrift, then refill it just below the catch threshold.
     unsafe {
-        let catch_threshold = (*foreign_page).catch_threshold();
+        let catch_threshold = foreign_page.as_ref().catch_threshold();
 
         let foreign_list = store.create_foreign_list(FOREIGN_PAGE, catch_threshold - FLUSH_TRESHOLD);
 
-        store.cast_adrift(&*foreign_page);
+        store.cast_adrift(foreign_page.as_ref());
 
-        (*foreign_page).refill_foreign(&foreign_list, |_| panic!("No recycler!"));
+        foreign_page.as_ref().refill_foreign(&foreign_list, |_| panic!("No recycler!"));
     }
 
     let thread_local = TestThreadLocal::default();
@@ -867,7 +863,7 @@ fn deallocate_foreign_recycle_immediate() {
     //  Provokes flush, which provokes a catch!
     let mut recycled = [0; 1];
 
-    unsafe { thread_local.deallocate(allocated[FLUSH_TRESHOLD - 1], store.recycler(&mut recycled[..])) };
+    unsafe { thread_local.deallocate(allocated[FLUSH_TRESHOLD - 1].unwrap(), store.recycler(&mut recycled[..])) };
 
     assert_eq!(FOREIGN_PAGE, recycled[0]);
 
@@ -885,35 +881,35 @@ fn deallocate_foreign_recycle_foreign() {
     let store = HugePageStore::default();
     let foreign_page = unsafe { store.provide(FOREIGN_PAGE, CLASS_SIZE) };
 
-    assert_eq!(FLUSH_TRESHOLD, unsafe { (*foreign_page).flush_threshold() });
+    assert_eq!(FLUSH_TRESHOLD, unsafe { foreign_page.as_ref().flush_threshold() });
 
-    let mut allocated = [ptr::null_mut(); FLUSH_TRESHOLD];
+    let mut allocated = [None; FLUSH_TRESHOLD];
     for p in &mut allocated {
-        *p = unsafe { (*foreign_page).allocate() };
-        assert_ne!(ptr::null_mut(), *p);
+        *p = unsafe { foreign_page.as_ref().allocate() };
+        assert_ne!(None, *p);
     }
 
     //  Cast the page adrift, then refill it just below the catch threshold.
     unsafe {
-        let catch_threshold = (*foreign_page).catch_threshold();
+        let catch_threshold = foreign_page.as_ref().catch_threshold();
 
         let foreign_list = store.create_foreign_list(FOREIGN_PAGE, catch_threshold - FLUSH_TRESHOLD);
 
-        store.cast_adrift(&*foreign_page);
+        store.cast_adrift(foreign_page.as_ref());
 
-        (*foreign_page).refill_foreign(&foreign_list, |_| panic!("No recycler!"));
+        foreign_page.as_ref().refill_foreign(&foreign_list, |_| panic!("No recycler!"));
     }
 
     let thread_local = TestThreadLocal::default();
 
     for p in &allocated[..(FLUSH_TRESHOLD - 1)] {
-        unsafe { thread_local.deallocate(*p, |_| panic!("No recycler!")) };
+        unsafe { thread_local.deallocate(p.unwrap(), |_| panic!("No recycler!")) };
     }
 
     //  Provokes flush, which provokes a catch!
     let mut recycled = [0; 1];
 
-    unsafe { thread_local.deallocate(allocated[FLUSH_TRESHOLD - 1], store.recycler(&mut recycled[..])) };
+    unsafe { thread_local.deallocate(allocated[FLUSH_TRESHOLD - 1].unwrap(), store.recycler(&mut recycled[..])) };
 
     assert_eq!(FOREIGN_PAGE, recycled[0]);
 
@@ -941,17 +937,17 @@ fn deallocate_foreign_last_list() {
     thread_local.foreign_allocations[1] = unsafe { store.create_foreign_list(THIRD_PAGE, 3) };
     thread_local.foreign_allocations[3] = unsafe { store.create_foreign_list(FOURTH_PAGE, 3) };
 
-    let mut allocated = [ptr::null_mut(); 5];
+    let mut allocated = [None; 5];
     for p in &mut allocated {
-        *p = unsafe { (*foreign_page).allocate() };
+        *p = unsafe { foreign_page.as_ref().allocate() };
     }
 
     for p in &allocated {
-        unsafe { thread_local.deallocate(*p, |_| panic!("No recycler!")) };
+        unsafe { thread_local.deallocate(p.unwrap(), |_| panic!("No recycler!")) };
     }
 
     assert_eq!(allocated.len(), thread_local.foreign_allocations[2].len());
-    assert_eq!(allocated[4], thread_local.foreign_allocations[2].head() as *mut u8);
+    assert_eq!(allocated[4], thread_local.foreign_allocations[2].head().map(NonNull::cast));
 }
 
 #[test]
@@ -976,18 +972,18 @@ fn deallocate_foreign_kick_out_longest_list() {
         other.materialize_foreign_list(&mut thread_local, CLASS_SIZE, bound..8, bound..8, 3);
     }
 
-    let mut allocated = [ptr::null_mut(); 5];
+    let mut allocated = [None; 5];
     for p in &mut allocated {
-        *p = unsafe { (*foreign_page).allocate() };
+        *p = unsafe { foreign_page.as_ref().allocate() };
     }
 
     //  Kicks out the longest list (at 2), to store those cells instead.
     for p in &allocated {
-        unsafe { thread_local.deallocate(*p, |_| panic!("No recycler!")) };
+        unsafe { thread_local.deallocate(p.unwrap(), |_| panic!("No recycler!")) };
     }
 
     assert_eq!(allocated.len(), thread_local.foreign_allocations[LONGEST_LIST].len());
-    assert_eq!(allocated[4], thread_local.foreign_allocations[LONGEST_LIST].head() as *mut u8);
+    assert_eq!(allocated[4], thread_local.foreign_allocations[LONGEST_LIST].head().map(NonNull::cast));
 }
 
 #[test]
@@ -1001,7 +997,7 @@ fn deallocate_foreign_recycle_longest_list() {
     let other = HugePageStore::default();
     let foreign_page = unsafe { store.provide(FOREIGN_PAGE, CLASS_SIZE) };
 
-    let catch_threshold = unsafe { (*foreign_page).catch_threshold() };
+    let catch_threshold = unsafe { foreign_page.as_ref().catch_threshold() };
     assert!(catch_threshold > 3, "{} <= 3", catch_threshold);
 
     let mut thread_local = TestThreadLocal::default();
@@ -1017,23 +1013,23 @@ fn deallocate_foreign_recycle_longest_list() {
 
     //  Cast kicked_page adrift.
     let kicked_page = store.get_large_page(KICKED_PAGE);
-    unsafe { store.cast_adrift(&*kicked_page) };
+    unsafe { store.cast_adrift(kicked_page.as_ref()) };
 
-    let mut allocated = [ptr::null_mut(); 5];
+    let mut allocated = [None; 5];
     for p in &mut allocated {
-        *p = unsafe { (*foreign_page).allocate() };
+        *p = unsafe { foreign_page.as_ref().allocate() };
     }
 
     //  Kicks out the longest list (at 2), recycling its page, to store those cells instead.
     let mut recycled = [0; 1];
     for p in &allocated {
-        unsafe { thread_local.deallocate(*p, store.recycler(&mut recycled[..])) };
+        unsafe { thread_local.deallocate(p.unwrap(), store.recycler(&mut recycled[..])) };
     }
 
     assert_eq!(KICKED_PAGE, recycled[0]);
 
     assert_eq!(allocated.len(), thread_local.foreign_allocations[LONGEST_LIST].len());
-    assert_eq!(allocated[4], thread_local.foreign_allocations[LONGEST_LIST].head() as *mut u8);
+    assert_eq!(allocated[4], thread_local.foreign_allocations[LONGEST_LIST].head().map(NonNull::cast));
 }
 
 }

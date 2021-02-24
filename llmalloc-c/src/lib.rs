@@ -3,7 +3,10 @@
 
 //! Exposition of LLAllocator API via a C ABI.
 
-use core::alloc::Layout;
+use core::{
+    alloc::Layout,
+    ptr::{self, NonNull},
+};
 
 use llmalloc::LLAllocator;
 
@@ -51,7 +54,7 @@ pub extern fn ll_malloc(size: usize) -> *mut u8 {
     //  -   `size` is a multiple of `alignment`.
     let layout = unsafe { Layout::from_size_align_unchecked(size, alignment) };
 
-    ALLOCATOR.allocate(layout)
+    ALLOCATOR.allocate(layout).map(|ptr| ptr.as_ptr()).unwrap_or(ptr::null_mut())
 }
 
 /// Allocates `size` bytes of memory, aligned as specified.
@@ -70,7 +73,7 @@ pub unsafe extern fn ll_aligned_malloc(size: usize, alignment: usize) -> *mut u8
     //  -   `size` is a multiple of `alignment`.
     let layout = Layout::from_size_align_unchecked(size, alignment);
 
-    ALLOCATOR.allocate(layout)
+    ALLOCATOR.allocate(layout).map(|ptr| ptr.as_ptr()).unwrap_or(ptr::null_mut())
 }
 
 /// Deallocates the memory located at `pointer`.
@@ -80,7 +83,11 @@ pub unsafe extern fn ll_aligned_malloc(size: usize, alignment: usize) -> *mut u8
 /// -   Assumes `pointer` has been returned by a prior call to `allocate`.
 /// -   Assumes `pointer` has not been deallocated since its allocation.
 /// -   Assumes the memory pointed by `pointer` is no longer in use.
-pub unsafe extern fn ll_free(pointer: *mut u8) { ALLOCATOR.deallocate(pointer) }
+pub unsafe extern fn ll_free(pointer: *mut u8) {
+    if let Some(pointer) = NonNull::new(pointer) {
+        ALLOCATOR.deallocate(pointer)
+    }
+}
 
 //
 //  Implementation

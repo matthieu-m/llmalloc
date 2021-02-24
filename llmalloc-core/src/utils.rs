@@ -1,12 +1,14 @@
 //! A collection of utilities.
 
+use core::ptr::NonNull;
+
 mod power_of_2;
 
 pub use power_of_2::PowerOf2;
 
 /// Returns whether the pointer is sufficiently aligned for the given alignment.
-pub(crate) fn is_sufficiently_aligned_for(ptr: *mut u8, alignment: PowerOf2) -> bool {
-    (ptr as usize) % alignment == 0
+pub(crate) fn is_sufficiently_aligned_for(ptr: NonNull<u8>, alignment: PowerOf2) -> bool {
+    (ptr.as_ptr() as usize) % alignment == 0
 }
 
 //  The Prefetch Guard is used to prevent pre-fetching on a previous page from accidentally causing false-sharing with
@@ -20,11 +22,13 @@ mod tests {
 
 use crate::PowerOf2;
 
+use super::*;
+
 #[test]
 fn is_sufficiently_aligned_for() {
     fn is_aligned_for(ptr: usize, alignment: usize) -> bool {
         let alignment = PowerOf2::new(alignment).unwrap();
-        let ptr = ptr as *mut u8;
+        let ptr = NonNull::new(ptr as *mut u8).unwrap();
         super::is_sufficiently_aligned_for(ptr, alignment)
     }
 

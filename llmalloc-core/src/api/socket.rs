@@ -12,7 +12,11 @@
 //! The name comes from the socket in which a CPU is plugged in, as a recommendation to use one instance of Socket Handle
 //! for each socket.
 
-use core::{alloc::Layout, ptr, sync::atomic};
+use core::{
+    alloc::Layout,
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
 use crate::{Configuration, DomainHandle, Platform, ThreadHandle};
 use crate::internals::socket_local::SocketLocal;
@@ -21,7 +25,7 @@ use crate::internals::socket_local::SocketLocal;
 ///
 /// The socket-local memory structures are thread-safe, but the handle itself is not. For a thread-safe handle, please
 /// see `AtomicSocketHandle`.
-pub struct SocketHandle<'a, C, P>(ptr::NonNull<SocketLocal<'a, C, P>>);
+pub struct SocketHandle<'a, C, P>(NonNull<SocketLocal<'a, C, P>>);
 
 impl<'a, C, P> SocketHandle<'a, C, P>
 where
@@ -112,7 +116,7 @@ where
     /// -   `thread_handle` belongs to this socket.
     /// -   `layout` is valid, as per `Self::is_valid_layout`.
     #[inline(always)]
-    pub unsafe fn allocate(&self, thread_handle: &ThreadHandle<C>, layout: Layout) -> *mut u8 {
+    pub unsafe fn allocate(&self, thread_handle: &ThreadHandle<C>, layout: Layout) -> Option<NonNull<u8>> {
         //  Safety:
         //  -   Local lifetime.
         let socket_local = self.0.as_ref();
@@ -132,7 +136,7 @@ where
     /// -   `thread_handle` belongs to this socket.
     /// -   `ptr` is a value allocated by an instance of `Self`, and the same underlying `Platform`.
     #[inline(always)]
-    pub unsafe fn deallocate(&self, thread_handle: &ThreadHandle<C>, ptr: *mut u8) {
+    pub unsafe fn deallocate(&self, thread_handle: &ThreadHandle<C>, ptr: NonNull<u8>) {
         //  Safety:
         //  -   Local lifetime.
         let socket_local = self.0.as_ref();
@@ -155,7 +159,7 @@ where
     /// -   `thread_handle` belongs to this socket.
     /// -   `ptr` is a value allocated by an instance of `Self`, and the same underlying `Platform`.
     #[inline(always)]
-    pub unsafe fn deallocate_uncached(&self, ptr: *mut u8) {
+    pub unsafe fn deallocate_uncached(&self, ptr: NonNull<u8>) {
         //  Safety:
         //  -   Local lifetime.
         let socket_local = self.0.as_ref();
@@ -166,7 +170,7 @@ where
 
 impl<'a, C, P> SocketHandle<'a, C, P> {
     /// Creates a new instance from its content.
-    pub(crate) fn from(socket: ptr::NonNull<SocketLocal<'a, C, P>>) -> Self { SocketHandle(socket) }
+    pub(crate) fn from(socket: NonNull<SocketLocal<'a, C, P>>) -> Self { SocketHandle(socket) }
 }
 
 impl<'a, C, P> Clone for SocketHandle<'a, C, P> {
@@ -185,34 +189,34 @@ impl<'a, C, P> Copy for SocketHandle<'a, C, P> {}
 ///
 /// -   The global array to avoid allocating more than one `SocketHandle` per socket.
 /// -   The thread-local `SocketHandle` is used to speed-up allocation and deallocation.
-pub struct AtomicSocketHandle<'a, C, P>(atomic::AtomicPtr<SocketLocal<'a, C, P>>);
+pub struct AtomicSocketHandle<'a, C, P>(AtomicPtr<SocketLocal<'a, C, P>>);
 
 impl <'a, C, P> AtomicSocketHandle<'a, C, P> {
     /// Creates a null instance.
-    pub const fn new() -> Self { Self(atomic::AtomicPtr::new(ptr::null_mut())) }
+    pub const fn new() -> Self { Self(AtomicPtr::new(ptr::null_mut())) }
 
     /// Initializes the instance with the given handle.
     ///
     /// If `self` is NOT currently None, then the initialization fails and the `handle` is returned.
     pub fn initialize(&self, handle: SocketHandle<'a, C, P>) -> Result<(), SocketHandle<'a, C, P>> {
-        self.0.compare_exchange(ptr::null_mut(), handle.0.as_ptr(), atomic::Ordering::Relaxed, atomic::Ordering::Relaxed)
+        self.0.compare_exchange(ptr::null_mut(), handle.0.as_ptr(), Ordering::Relaxed, Ordering::Relaxed)
             .and(Ok(()))
             .or(Err(handle))
     }
 
     /// Loads the value of the handle, it may be None.
     pub fn load(&self) -> Option<SocketHandle<'a, C, P>> {
-        ptr::NonNull::new(self.0.load(atomic::Ordering::Relaxed)).map(SocketHandle)
+        NonNull::new(self.0.load(Ordering::Relaxed)).map(SocketHandle)
     }
 
     /// Stores a handle, discards the previous handle if any.
     ///
     /// This method should generally be used only at start-up, to initialize the instance.
     pub fn store(&self, handle: SocketHandle<'a, C, P>) {
-        self.0.store(handle.0.as_ptr(), atomic::Ordering::Relaxed);
+        self.0.store(handle.0.as_ptr(), Ordering::Relaxed);
     }
 }
 
 impl<'a, C, P> Default for AtomicSocketHandle<'a, C, P> {
-    fn default() -> Self { Self(atomic::AtomicPtr::new(ptr::null_mut())) }
+    fn default() -> Self { Self(AtomicPtr::new(ptr::null_mut())) }
 }

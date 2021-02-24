@@ -6,7 +6,13 @@
 //! The Huge Allocations Manager bridges the gap by recording the original layout on allocation and providing back on
 //! deallocation.
 
-use core::{alloc::Layout, cmp, marker, ptr, sync::atomic};
+use core::{
+    alloc::Layout,
+    cmp,
+    marker::PhantomData,
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use crate::{Configuration, Platform, PowerOf2};
 use crate::utils;
@@ -18,7 +24,7 @@ pub(crate) struct HugeAllocator<C, P> {
     //  As an optimization, allocations for which `size == C::HUGE_PAGE_SIZE` are not recorded.
     allocations: [AtomicHugeAllocation<C>; 128],
     platform: P,
-    _configuration: marker::PhantomData<*const C>,
+    _configuration: PhantomData<*const C>,
 }
 
 impl<C, P> HugeAllocator<C, P> {
@@ -46,7 +52,7 @@ impl<C, P> HugeAllocator<C, P> {
             aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(), aha(),
         ];
 
-        let _configuration = marker::PhantomData;
+        let _configuration = PhantomData;
 
         Self { allocations, platform, _configuration, }
     }
@@ -62,7 +68,7 @@ impl<C, P> HugeAllocator<C, P>
 {
     /// Allocates a Huge allocation.
     #[inline(never)]
-    pub(crate) fn allocate_huge(&self, layout: Layout) -> *mut u8 {
+    pub(crate) fn allocate_huge(&self, layout: Layout) -> Option<NonNull<u8>> {
         debug_assert!(layout.align().count_ones() == 1, "Invalid layout!");
 
         let align = cmp::max(C::HUGE_PAGE_SIZE.value(), layout.align());
@@ -74,7 +80,7 @@ impl<C, P> HugeAllocator<C, P>
         debug_assert!(size >= C::HUGE_PAGE_SIZE.value());
 
         if size > HugeAllocation::<C>::MAX_SIZE {
-            return ptr::null_mut();
+            return None;
         }
 
         //  Safety:
@@ -86,21 +92,19 @@ impl<C, P> HugeAllocator<C, P>
         let result = unsafe { self.platform.allocate(layout) };
 
         //  If null, no need to memorize it, there's nothing to deallocate.
-        if result.is_null() {
-            return result;
-        }
+        let result = result?;
 
         //  Safety:
         //  -   `size` is <= `HugeAllocation::<C>::MAX_SIZE`.
         //  -   `size` is >= `C::HUGE_PAGE_SIZE`.
         if unsafe { self.push_allocation(result, size) } {
-            return result;
+            return Some(result);
         }
 
         //  Oopsie, no place to register it!
         unsafe { self.platform.deallocate(result, layout) };
 
-        ptr::null_mut()
+        None
     }
 
     /// Deallocates a Huge allocation.
@@ -110,7 +114,7 @@ impl<C, P> HugeAllocator<C, P>
     /// -   Assumes that `ptr` was allocated by `self`.
     /// -   Assumes that `ptr` points to the start of the allocation.
     #[inline(never)]
-    pub(crate) unsafe fn deallocate_huge(&self, ptr: *mut u8) {
+    pub(crate) unsafe fn deallocate_huge(&self, ptr: NonNull<u8>) {
         debug_assert!(utils::is_sufficiently_aligned_for(ptr, C::HUGE_PAGE_SIZE));
 
         let size = self.pop_allocation(ptr);
@@ -139,7 +143,7 @@ impl<C, P> HugeAllocator<C, P>
     //  -   Assumes that `size` is less than or equal to `MAX_SIZE`.
     //  -   Assumes that `size` is strictly greater than `C::HUGE_PAGE_SIZE`.
     #[must_use]
-    unsafe fn push_allocation(&self, ptr: *mut u8, size: usize) -> bool {
+    unsafe fn push_allocation(&self, ptr: NonNull<u8>, size: usize) -> bool {
         //  Optimize storage of single huge pages.
         if size == C::HUGE_PAGE_SIZE.value() {
             return true;
@@ -166,12 +170,12 @@ impl<C, P> HugeAllocator<C, P>
     //  #   Safety
     //
     //  -   Assumes that `ptr` was allocated by `self`.
-    unsafe fn pop_allocation(&self, ptr: *mut u8) -> usize {
+    unsafe fn pop_allocation(&self, ptr: NonNull<u8>) -> usize {
         for huge in &self.allocations[..] {
             let allocation = huge.load();
             let (p, size) = allocation.inflate();
 
-            if p != ptr {
+            if p != Some(ptr) {
                 continue;
             }
 
@@ -198,11 +202,11 @@ unsafe impl<C, P> Sync for HugeAllocator<C, P> {}
 //
 
 //  A compressed representation of a pointer to a HugePage and the number of HugePages.
-struct AtomicHugeAllocation<C>(atomic::AtomicUsize, marker::PhantomData<*const C>);
+struct AtomicHugeAllocation<C>(AtomicUsize, PhantomData<*const C>);
 
 impl<C> AtomicHugeAllocation<C> {
     /// Returns an instance.
-    const fn new() -> Self { Self(atomic::AtomicUsize::new(0), marker::PhantomData) }
+    const fn new() -> Self { Self(AtomicUsize::new(0), PhantomData) }
 }
 
 impl<C> AtomicHugeAllocation<C>
@@ -211,23 +215,23 @@ impl<C> AtomicHugeAllocation<C>
 {
     /// Returns the `HugeAllocation`.
     fn load(&self) -> HugeAllocation<C> {
-        let huge = self.0.load(atomic::Ordering::Relaxed);
-        HugeAllocation(huge, marker::PhantomData)
+        let huge = self.0.load(Ordering::Relaxed);
+        HugeAllocation(huge, PhantomData)
     }
 
     /// Sets to `HugeAllocation` if equal to `current`; returns true on success, false on failure.
     #[must_use]
     fn replace(&self, current: HugeAllocation<C>, new: HugeAllocation<C>) -> bool {
-        self.0.compare_exchange(current.0, new.0, atomic::Ordering::Relaxed, atomic::Ordering::Relaxed).is_ok()
+        self.0.compare_exchange(current.0, new.0, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
 }
 
 impl<C> Default for AtomicHugeAllocation<C> {
-    fn default() -> Self { Self(atomic::AtomicUsize::new(0), marker::PhantomData) }
+    fn default() -> Self { Self(AtomicUsize::new(0), PhantomData) }
 }
 
 //  A compressed representation of a pointer to a HugePage and the number of HugePages.
-struct HugeAllocation<C>(usize, marker::PhantomData<*const C>);
+struct HugeAllocation<C>(usize, PhantomData<*const C>);
 
 impl<C> HugeAllocation<C>
     where
@@ -242,24 +246,24 @@ impl<C> HugeAllocation<C>
     ///
     /// -   Assumes that `size` is less than or equal to `MAX_SIZE`.
     /// -   Assumes that `size` is zero or greater than or equal to `C::HUGE_PAGE_SIZE`.
-    unsafe fn new(ptr: *mut u8, size: usize) -> Self {
+    unsafe fn new(ptr: NonNull<u8>, size: usize) -> Self {
         debug_assert!(utils::is_sufficiently_aligned_for(ptr, C::HUGE_PAGE_SIZE),
-            "{} not aligned on {}", ptr as usize, C::HUGE_PAGE_SIZE.value());
+            "{} not aligned on {}", ptr.as_ptr() as usize, C::HUGE_PAGE_SIZE.value());
         debug_assert!(size % C::HUGE_PAGE_SIZE == 0, "{} not a multiple of {}", size, C::HUGE_PAGE_SIZE.value());
         debug_assert!(size <= Self::MAX_SIZE, "{} greater than {}", size, Self::MAX_SIZE);
 
-        let ptr = ptr as usize;
+        let ptr = ptr.as_ptr() as usize;
         let compressed_size = size / C::HUGE_PAGE_SIZE;
 
-        Self(ptr + compressed_size, marker::PhantomData)
+        Self(ptr + compressed_size, PhantomData)
     }
 
     /// Returns the uncompressed pointer and size.
-    fn inflate(&self) -> (*mut u8, usize) {
+    fn inflate(&self) -> (Option<NonNull<u8>>, usize) {
         let compressed_ptr = self.0 / C::HUGE_PAGE_SIZE;
         let compressed_size = self.0 % C::HUGE_PAGE_SIZE;
 
-        let ptr = (compressed_ptr * C::HUGE_PAGE_SIZE) as *mut u8;
+        let ptr = NonNull::new((compressed_ptr * C::HUGE_PAGE_SIZE) as *mut u8);
         let size = compressed_size * C::HUGE_PAGE_SIZE;
 
         (ptr, size)
@@ -273,13 +277,16 @@ impl<C> Clone for HugeAllocation<C> {
 impl<C> Copy for HugeAllocation<C> {}
 
 impl<C> Default for HugeAllocation<C> {
-    fn default() -> Self { Self(0, marker::PhantomData) }
+    fn default() -> Self { Self(0, PhantomData) }
 }
 
 #[cfg(test)]
 mod tests {
 
-use core::mem;
+use core::{
+    cell::UnsafeCell,
+    mem,
+};
 
 use crate::PowerOf2;
 
@@ -298,7 +305,7 @@ impl Configuration for TestConfiguration {
 
 #[repr(align(1024))]
 struct TestPlatform {
-    pool: core::cell::UnsafeCell<[u8; 1024]>,
+    pool: UnsafeCell<[u8; 1024]>,
 }
 
 impl TestPlatform {
@@ -322,7 +329,7 @@ impl TestPlatform {
 }
 
 impl Platform for TestPlatform {
-    unsafe fn allocate(&self, layout: Layout) -> *mut u8 {
+    unsafe fn allocate(&self, layout: Layout) -> Option<NonNull<u8>> {
         let huge = TestConfiguration::HUGE_PAGE_SIZE.value();
 
         assert!(layout.align() >= huge);
@@ -339,14 +346,14 @@ impl Platform for TestPlatform {
 
             if slice.iter().all(|x| **x == 0) {
                 slice.iter().for_each(|x| **x = 1);
-                return slice[0];
+                return NonNull::new(slice[0]);
             }
         }
 
-        ptr::null_mut()
+        None
     }
 
-    unsafe fn deallocate(&self, ptr: *mut u8, layout: Layout) {
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
         let huge = TestConfiguration::HUGE_PAGE_SIZE.value();
 
         assert_eq!(layout.align(), huge);
@@ -359,7 +366,7 @@ impl Platform for TestPlatform {
         assert!(number_pages <= starters.len());
 
         for slice in starters.windows(number_pages) {
-            if slice[0] == ptr {
+            if slice[0] == ptr.as_ptr() {
                 assert!(slice.iter().all(|x| **x == 1));
 
                 slice.iter().for_each(|x| **x = 0);
@@ -383,10 +390,10 @@ fn huge_allocation_new_inflate() {
         let page_size = C::HUGE_PAGE_SIZE;
 
         let ptr = ptr * page_size;
-        let huge = unsafe { Allocation::new(ptr as *mut u8, size * page_size) };
+        let huge = unsafe { Allocation::new(NonNull::new(ptr as *mut u8).unwrap(), size * page_size) };
 
         let (ptr, size) = huge.inflate();
-        let ptr = ptr as usize;
+        let ptr = ptr.map(|ptr| ptr.as_ptr() as usize).unwrap_or(0);
 
         (ptr / page_size, size / page_size)
     }
@@ -403,10 +410,14 @@ fn atomic_huge_allocation_load_replace() {
     fn huge_allocation(ptr: usize, size: usize) -> Allocation {
         type C = TestConfiguration;
 
+        if ptr == 0 {
+            return Allocation::default();
+        }
+
         let page_size = C::HUGE_PAGE_SIZE;
 
         let ptr = ptr * page_size;
-        unsafe { Allocation::new(ptr as *mut u8, size * page_size) }
+        unsafe { Allocation::new(NonNull::new(ptr as *mut u8).unwrap(), size * page_size) }
     }
 
     fn load(atomic: &AtomicAllocation) -> (usize, usize) {
@@ -415,7 +426,7 @@ fn atomic_huge_allocation_load_replace() {
         let page_size = C::HUGE_PAGE_SIZE;
 
         let (ptr, size) = atomic.load().inflate();
-        let ptr = ptr as usize;
+        let ptr = ptr.map(|ptr| ptr.as_ptr() as usize).unwrap_or(0);
 
         (ptr / page_size, size / page_size)
     }
@@ -449,17 +460,17 @@ fn huge_allocator_allocate_underaligned() {
     let starters = platform.starters();
 
     let ptr = allocator.allocate_huge(layout(huge));
-    assert!(!ptr.is_null());
-    assert_eq!(starters[0], ptr);
+    assert!(ptr.is_some());
+    assert_eq!(starters[0], ptr.unwrap().as_ptr());
     assert_eq!([true, false, false, false], platform.occupied());
 
     let ptr = allocator.allocate_huge(layout(huge * 2));
-    assert!(!ptr.is_null());
-    assert_eq!(starters[1], ptr);
+    assert!(ptr.is_some());
+    assert_eq!(starters[1], ptr.unwrap().as_ptr());
     assert_eq!([true, true, true, false], platform.occupied());
 
     let ptr = allocator.allocate_huge(layout(huge * 2));
-    assert!(ptr.is_null());
+    assert!(ptr.is_none());
 }
 
 #[test]
@@ -471,8 +482,8 @@ fn huge_allocator_allocate_overaligned() {
     let starters = platform.starters();
 
     let ptr = allocator.allocate_huge(Layout::from_size_align(huge, 4 * huge).unwrap());
-    assert!(!ptr.is_null());
-    assert_eq!(starters[0], ptr);
+    assert!(ptr.is_some());
+    assert_eq!(starters[0], ptr.unwrap().as_ptr());
     assert_eq!([true, true, true, true], platform.occupied());
 }
 
@@ -490,10 +501,10 @@ fn huge_allocator_deallocate() {
 
     assert_eq!([true, true, true, true], platform.occupied());
 
-    unsafe { allocator.deallocate_huge(two) };
+    unsafe { allocator.deallocate_huge(two.unwrap()) };
     assert_eq!([true, true, true, false], platform.occupied());
 
-    unsafe { allocator.deallocate_huge(one) };
+    unsafe { allocator.deallocate_huge(one.unwrap()) };
     assert_eq!([false, false, false, false], platform.occupied());
 }
 

@@ -4,11 +4,22 @@
 //!
 //! Each instance of a Large Page can only fulfill allocations of a specific ClassSize.
 
-use core::{cell, cmp, mem, ptr, sync::atomic};
+use core::{
+    cell::Cell,
+    cmp,
+    mem,
+    ptr::{self, NonNull},
+    sync::atomic::{self, Ordering},
+};
 
 use crate::{ClassSize, Configuration, PowerOf2};
-use crate::internals::cells::{CellLocal, CellLocalPtr, CellForeignList, CellAtomicForeignPtr};
-use crate::utils;
+use crate::{
+    internals::{
+        atomic::AtomicPtr,
+        blocks::{AtomicBlockForeignPtr, BlockLocal, BlockLocalStack, BlockForeignList}
+    },
+    utils,
+};
 
 /// The header of a Large Page, for normal allocations.
 #[repr(C)]
@@ -26,15 +37,16 @@ impl LargePage {
     ///
     /// -   Assumes that there is sufficient memory available.
     /// -   Assumes that the pointer is correctly aligned.
-    pub(crate) unsafe fn initialize<C>(place: &mut [u8], owner: *mut (), class_size: ClassSize) -> *mut Self
+    pub(crate) unsafe fn initialize<C>(place: &mut [u8], owner: *mut (), class_size: ClassSize) -> NonNull<Self>
         where
             C: Configuration,
     {
         debug_assert!(place.len() >= C::LARGE_PAGE_SIZE.value());
 
-        let at = place.as_mut_ptr();
+        //  Safety:
+        //  -   `place` is not a null slice.
+        let at = NonNull::new_unchecked(place.as_mut_ptr());
 
-        debug_assert!(!at.is_null());
         debug_assert!(utils::is_sufficiently_aligned_for(at, C::LARGE_PAGE_SIZE));
         debug_assert!(!utils::is_sufficiently_aligned_for(at, C::HUGE_PAGE_SIZE));
 
@@ -42,16 +54,16 @@ impl LargePage {
         //  -   `at` is assumed to be sufficiently sized.
         //  -   `at` is assumed to be sufficiently aligned.
         #[allow(clippy::cast_ptr_alignment)]
-        let large_page = at as *mut Self;
+        let large_page = at.as_ptr() as *mut Self;
 
         //  Safety:
         //  -   `large_page` is accessed exclusively from this thread.
         ptr::write(large_page, Self::new::<C>(at, owner, class_size));
 
         //  Enforce memory ordering, later Acquire need to see those 0s and 1s.
-        atomic::fence(atomic::Ordering::Release);
+        atomic::fence(Ordering::Release);
 
-        large_page
+        at.cast()
     }
 
     /// Obtain the large page associated to a given allocation.
@@ -59,16 +71,18 @@ impl LargePage {
     /// #   Safety
     ///
     /// -   Assumes that the pointer is pointing strictly _inside_ a LargePage.
-    pub(crate) unsafe fn from_raw<C>(ptr: *mut u8) -> *mut LargePage
+    pub(crate) unsafe fn from_raw<C>(ptr: NonNull<u8>) -> NonNull<Self>
         where
             C: Configuration,
     {
         debug_assert!(!utils::is_sufficiently_aligned_for(ptr, C::LARGE_PAGE_SIZE));
 
-        let address = ptr as usize;
+        let address = ptr.as_ptr() as usize;
         let large_page = C::LARGE_PAGE_SIZE.round_down(address);
 
-        large_page as *mut LargePage
+        //  Safety:
+        //  -   Not null, by assumption.
+        NonNull::new_unchecked(large_page as *mut Self)
     }
 
     /// Returns the owner of the page.
@@ -84,31 +98,26 @@ impl LargePage {
     #[cfg(test)]
     pub(crate) fn catch_threshold(&self) -> usize { self.foreign.catch_threshold }
 
-    /// Allocate one cell from the page, if any.
+    /// Allocate one block from the page, if any.
     ///
-    /// Returns a null pointer if no cell is available.
+    /// Returns a null pointer if no block is available.
     ///
     /// #   Safety
     ///
     /// -   Assumes that a single thread calls `allocate` at a time.
-    pub(crate) unsafe fn allocate(&self) -> *mut u8 {
-        let ptr = self.local.allocate();
-
-        if !ptr.is_null() {
-            ptr
-        } else {
-            self.foreign.allocate(&self.local)
-        }
+    pub(crate) unsafe fn allocate(&self) -> Option<NonNull<u8>> {
+        self.local.allocate()
+            .or_else(|| self.foreign.allocate(&self.local))
     }
 
-    /// Deallocate a cell from the local thread.
+    /// Deallocate a block from the local thread.
     ///
     /// #   Safety
     ///
     /// -   Assumes that a single thread calls `deallocate` at a time.
-    /// -   Assumes that the pointer is pointing to a cell inside _this_ LargePage.
-    /// -   Assumes that the pointed cell is no longer in use.
-    pub(crate) unsafe fn deallocate(&self, ptr: *mut u8) {
+    /// -   Assumes that the pointer is pointing to a block inside _this_ LargePage.
+    /// -   Assumes that the pointed block is no longer in use.
+    pub(crate) unsafe fn deallocate(&self, ptr: NonNull<u8>) {
         debug_assert!(self.common.is_local_cell_pointer(ptr));
 
         self.local.deallocate(ptr);
@@ -122,10 +131,15 @@ impl LargePage {
     ///
     /// -   Assumes that a single thread calls `deallocate` at a time.
     /// -   Assumes that the access to the linked cells, is exclusive.
-    pub(crate) unsafe fn refill_local(&self, list: &CellForeignList) {
+    pub(crate) unsafe fn refill_local(&self, list: &BlockForeignList) {
         debug_assert!(!list.is_empty());
 
-        if !self.common.is_local_cell_pointer(list.head() as *mut u8) {
+        let head = match list.head() {
+            None => return,
+            Some(head) => head,
+        };
+
+        if !self.common.is_local_cell_pointer(head.cast()) {
             return;
         }
 
@@ -141,41 +155,41 @@ impl LargePage {
     /// -   Assumes that the linked cells actually belong to the page!
     /// -   Assumes that the access to the linked cells, is exclusive.
     #[inline(never)]
-    pub(crate) unsafe fn refill_foreign<F>(&self, list: &CellForeignList, mut recycler: F)
+    pub(crate) unsafe fn refill_foreign<F>(&self, list: &BlockForeignList, mut recycler: F)
         where
-            F: FnMut(*mut LargePage),
+            F: FnMut(NonNull<LargePage>),
     {
         debug_assert!(!list.is_empty());
-        debug_assert!(self.common.is_local_cell_pointer(list.head() as *mut u8));
+        debug_assert!(self.common.is_local_cell_pointer(list.head().expect("Not empty").cast()));
 
         if self.foreign.refill(list) {
-            recycler(self as *const _ as *mut _);
+            recycler(NonNull::from(self));
         }
     }
 
     //  Internal: Creates an instance of `LargePage` at the designated address.
-    unsafe fn new<C>(at: *mut u8, owner: *mut (), class_size: ClassSize) -> Self
+    unsafe fn new<C>(at: NonNull<u8>, owner: *mut (), class_size: ClassSize) -> Self
         where
             C: Configuration,
     {
         let large_page_size = C::LARGE_PAGE_SIZE;
 
         let layout = class_size.layout();
-        let cell_size = layout.size();
+        let block_size = layout.size();
 
         let reserved = cmp::max(mem::size_of::<Self>(), layout.align());
         let number_cells = class_size.number_elements(large_page_size.value() - reserved);
         debug_assert!(number_cells >= 1);
 
-        let end = at.add(large_page_size.value());
-        let begin = end.sub(number_cells * cell_size);
+        let end = NonNull::new_unchecked(at.as_ptr().add(large_page_size.value()));
+        let begin = NonNull::new_unchecked(end.as_ptr().sub(number_cells * block_size));
     
         let flush_threshold = cmp::max(number_cells / 64, 1);
         let catch_threshold = cmp::max(number_cells / 4, 1);
 
         let _prefetch = utils::PrefetchGuard::default();
         let common = Common::new(owner, class_size, flush_threshold, begin, end);
-        let local = Local::new(cell_size, begin, end);
+        let local = Local::new(block_size, begin, end);
         let foreign = Foreign::new(catch_threshold);
 
         Self { _prefetch, common, local, foreign, }
@@ -184,32 +198,30 @@ impl LargePage {
 
 /// A linked-list of LargePages.
 #[derive(Default)]
-pub(crate) struct LargePageStack(LargePagePtr);
+pub(crate) struct LargePageStack(AtomicPtr<LargePage>);
 
 impl LargePageStack {
     /// Pops the head of the stack, it may be null.
-    pub(crate) unsafe fn pop(&self) -> *mut LargePage {
+    pub(crate) unsafe fn pop(&self) -> Option<NonNull<LargePage>> {
         let mut head = self.0.load();
 
         loop {
-            if head.is_null() {
-                return head;
-            }
+            let head_ptr = head?;
 
             //  Safety:
             //  -   `head` is not null.
-            let next = (*head).foreign.next.load();
+            let next = head_ptr.as_ref().foreign.next.load();
 
-            if let Some(new_head) = self.0.exchange(head, next) {
+            if let Err(new_head) = self.0.compare_exchange(head, next) {
                 head = new_head;
                 continue;
             }
 
-            debug_assert!(!head.is_null());
+            debug_assert!(!head.is_none());
 
             //  Safety:
             //  -   `head` is not null.
-            (*head).foreign.next.store(ptr::null_mut());
+            head_ptr.as_ref().foreign.next.store(None);
 
             return head;
         }
@@ -221,21 +233,19 @@ impl LargePageStack {
     ///
     /// -   `page` must not be null.
     /// -   `page.foreign.next` must be null.
-    pub(crate) unsafe fn push(&self, page: *mut LargePage) {
-        debug_assert!(!page.is_null());
-
+    pub(crate) unsafe fn push(&self, page: NonNull<LargePage>) {
         //  Safety:
         //  -   `page` is not null.
-        let large_page = &*page;
+        let large_page = page.as_ref();
 
-        debug_assert!(large_page.foreign.next.is_null());
+        debug_assert!(large_page.foreign.next.load().is_none());
 
         let mut head = self.0.load();
 
         loop {
             large_page.foreign.next.store(head);
 
-            if let Some(new_head) = self.0.exchange(head, page) {
+            if let Err(new_head) = self.0.compare_exchange(head, Some(page)) {
                 head = new_head;
                 continue;
             }
@@ -245,7 +255,7 @@ impl LargePageStack {
     }
 
     #[cfg(test)]
-    pub(crate) unsafe fn peek(&self) -> *mut LargePage {
+    pub(crate) unsafe fn peek(&self) -> Option<NonNull<LargePage>> {
         self.0.load()
     }
 }
@@ -270,24 +280,32 @@ struct Common {
     //  should be returned to this page instead.
     flush_threshold: usize,
     //  Pointer to the beginning of the page, the initial value of `self.next`.
-    begin: *mut u8,
+    begin: NonNull<u8>,
     //  Pointer to the end of the page; when `watermark == end`, the entire page has been carved.
     //
     //  When the entire page has been carved, acquiring new cells from the page is only possible through `foreign.freed`.
-    end: *mut u8,
+    end: NonNull<u8>,
 }
 
 impl Common {
     /// Creates a new instance of `Common`.
-    fn new(owner: *mut (), class_size: ClassSize, flush_threshold: usize, begin: *mut u8, end: *mut u8) -> Self {
+    fn new(
+        owner: *mut (),
+        class_size: ClassSize,
+        flush_threshold: usize,
+        begin: NonNull<u8>,
+        end: NonNull<u8>
+    )
+        -> Self
+    {
         debug_assert!(flush_threshold >= 1);
 
         Self { owner, class_size, flush_threshold, begin, end, }
     }
 
-    /// Checks whether the pointer points to a Cell within this page.
-    fn is_local_cell_pointer(&self, ptr: *mut u8) -> bool {
-        let (ptr, begin, end) = (ptr as usize, self.begin as usize, self.end as usize);
+    /// Checks whether the pointer points to a Block within this page.
+    fn is_local_cell_pointer(&self, ptr: NonNull<u8>) -> bool {
+        let (ptr, begin, end) = (ptr.as_ptr() as usize, self.begin.as_ptr() as usize, self.end.as_ptr() as usize);
 
         begin <= ptr && ptr < end
     }
@@ -296,20 +314,20 @@ impl Common {
 //  Local data. Only accessible from the local thread.
 #[repr(align(128))]
 struct Local {
-    //  Pointer to the next free cell, if any.
-    next: CellLocalPtr,
+    //  Stack of free blocks.
+    next: BlockLocalStack,
     //  Pointer to the beginning of the uncarved area of the page.
     //
-    //  Linking all the cells together when creating the page would take too long, so instead only the first cell is
+    //  Linking all the cells together when creating the page would take too long, so instead only the first block is
     //  prepared, and the `watermark` and `end` are initialized to denote the area of the page which can freely be
     //  carved into further cells.
-    watermark: cell::Cell<*mut u8>,
+    watermark: Cell<NonNull<u8>>,
     //  Pointer to the end of the page; when `watermark == end`, the entire page has been carved.
     //
     //  When the entire page has been carved, acquiring new cells from the page is only possible through `foreign.freed`.
-    end: *mut u8,
+    end: NonNull<u8>,
     //  Size, in bytes, of the cells.
-    cell_size: usize,
+    block_size: usize,
 }
 
 impl Local {
@@ -317,42 +335,42 @@ impl Local {
     ///
     /// #   Safety
     ///
-    /// -   `begin` and `end` are assumed to be correctly aligned and sized for a `CellForeign` pointer.
-    /// -   `end - begin` is assumed to be a multiple of `cell_size`.
-    unsafe fn new(cell_size: usize, begin: *mut u8, end: *mut u8) -> Self {
-        debug_assert!(cell_size >= 1);
-        debug_assert!((end as usize - begin as usize) % cell_size == 0,
-            "cell_size: {}, begin: {:x}, end: {:x}", cell_size, begin as usize, end as usize);
+    /// -   `begin` and `end` are assumed to be correctly aligned and sized for a `BlockForeign` pointer.
+    /// -   `end - begin` is assumed to be a multiple of `block_size`.
+    unsafe fn new(block_size: usize, begin: NonNull<u8>, end: NonNull<u8>) -> Self {
+        debug_assert!(block_size >= 1);
+        debug_assert!((end.as_ptr() as usize - begin.as_ptr() as usize) % block_size == 0,
+            "block_size: {}, begin: {:x}, end: {:x}", block_size, begin.as_ptr() as usize, end.as_ptr() as usize);
 
-        let next = CellLocalPtr::from_raw(begin);
-        let watermark = cell::Cell::new(begin.add(cell_size));
+        let next = BlockLocalStack::from_raw(begin);
+        let watermark = Cell::new(NonNull::new_unchecked(begin.as_ptr().add(block_size)));
 
-        Self { next, watermark, end, cell_size, }
+        Self { next, watermark, end, block_size, }
     }
 
     /// Allocates one cell from the page, if any.
     ///
     /// Returns a null pointer is no cell is available.
-    fn allocate(&self) -> *mut u8 {
+    fn allocate(&self) -> Option<NonNull<u8>> {
         //  Fast Path.
-        if let Some(cell) = self.next.pop() {
-            return cell.as_ptr() as *mut u8;
+        if let Some(block) = self.next.pop() {
+            return Some(block.cast());
         }
 
         //  Cruise path.
         if self.watermark.get() == self.end {
-            return ptr::null_mut();
+            return None;
         }
 
         //  Expansion path.
         let result = self.watermark.get();
 
         //  Safety:
-        //  -   `self.cell_size` matches the size of the cells.
+        //  -   `self.block_size` matches the size of the cells.
         //  -   `self.watermark` is still within bounds.
-        unsafe { self.watermark.set(result.add(self.cell_size)) };
+        unsafe { self.watermark.set(NonNull::new_unchecked(result.as_ptr().add(self.block_size))) };
 
-        result as *mut u8
+        Some(result.cast())
     }
 
     /// Deallocates one cell from the page.
@@ -361,17 +379,15 @@ impl Local {
     ///
     /// -   Assumes that `ptr` is sufficiently sized.
     /// -   Assumes that `ptr` is sufficiently aligned.
-    unsafe fn deallocate(&self, ptr: *mut u8) {
-        debug_assert!(utils::is_sufficiently_aligned_for(ptr, PowerOf2::align_of::<CellLocal>()));
+    unsafe fn deallocate(&self, ptr: NonNull<u8>) {
+        debug_assert!(utils::is_sufficiently_aligned_for(ptr, PowerOf2::align_of::<BlockLocal>()));
 
         //  Safety:
-        //  -   `ptr` is assumed to be non-null.
         //  -   `ptr` is assumed to be sufficiently sized.
         //  -   `ptr` is assumed to be sufficiently aligned.
-        #[allow(clippy::cast_ptr_alignment)]
-        let cell = ptr::NonNull::new_unchecked(ptr as *mut CellLocal);
+        let block = ptr.cast();
 
-        self.next.push(cell);
+        self.next.push(block);
     }
 
     /// Extends the local list from a foreign list.
@@ -379,7 +395,7 @@ impl Local {
     /// #   Safety
     ///
     /// -   Assumes that the access to the linked cells, is exclusive.
-    unsafe fn extend(&self, list: &CellForeignList) {
+    unsafe fn extend(&self, list: &BlockForeignList) {
         debug_assert!(!list.is_empty());
 
         //  Safety:
@@ -392,7 +408,7 @@ impl Local {
     /// #   Safety
     ///
     /// -   Assumes that access to the cell, and all linked cells, is exclusive.
-    unsafe fn refill(&self, list: ptr::NonNull<CellLocal>) {
+    unsafe fn refill(&self, list: NonNull<BlockLocal>) {
         //  Safety:
         //  -   It is assumed that access to the cell, and all linked cells, is exclusive.
         self.next.refill(list);
@@ -403,9 +419,9 @@ impl Local {
 #[repr(align(128))]
 struct Foreign {
     //  Pointer to the next LargePage.
-    next: LargePagePtr,
+    next: AtomicPtr<LargePage>,
     //  List of cells returned by other threads.
-    freed: CellAtomicForeignPtr,
+    freed: AtomicBlockForeignPtr,
     //  The adrift marker.
     //
     //  A page that is too full is marked as "adrift", and cast away. As cells are freed -- as denoted by next.length
@@ -420,8 +436,8 @@ impl Foreign {
     fn new(catch_threshold: usize) -> Self {
         debug_assert!(catch_threshold >= 1);
 
-        let next = LargePagePtr::default();
-        let freed = CellAtomicForeignPtr::default();
+        let next = AtomicPtr::default();
+        let freed = AtomicBlockForeignPtr::default();
         let adrift = Adrift::default();
 
         Self { next, freed, adrift, catch_threshold, }
@@ -430,7 +446,7 @@ impl Foreign {
     /// Attempts to refill `local` from foreign, and allocate.
     ///
     /// In case of failure, the page is cast adrift and null is returned.
-    unsafe fn allocate(&self, local: &Local) -> *mut u8 {
+    unsafe fn allocate(&self, local: &Local) -> Option<NonNull<u8>> {
         //  If the number of freed cells is sufficient to catch the page, immediately recycle them.
         if self.freed.len() >= self.catch_threshold {
             return self.recycle_allocate(local);
@@ -443,7 +459,7 @@ impl Foreign {
         //  There is an inherent race-condition, above, as a foreign thread may have extended the freed list beyond
         //  the catch threshold and yet seen a non-adrift page. The current thread therefore needs to check again.
         if self.freed.len() < self.catch_threshold {
-            return ptr::null_mut();
+            return None;
         }
 
         //  A race-condition DID occur! Let's attempt to catch the adrift page then!
@@ -452,7 +468,7 @@ impl Foreign {
             self.recycle_allocate(local)
         } else {
             //  The page was caught by another thread, it can no longer be used by this thread.
-            ptr::null_mut()
+            None
         }
     }
 
@@ -464,7 +480,7 @@ impl Foreign {
     ///
     /// -   Assumes that the linked cells are not empty.
     /// -   Assumes that the linked cells actually belong to the page!
-    unsafe fn refill(&self, list: &CellForeignList) -> bool {
+    unsafe fn refill(&self, list: &BlockForeignList) -> bool {
         //  Safety:
         //  -   `list` is assumed not be empty.
         let len = self.freed.extend(list);
@@ -485,16 +501,16 @@ impl Foreign {
     //  #   Safety
     //
     //  -   Assumes that the current LargePage is owned by the current thread.
-    unsafe fn recycle_allocate(&self, local: &Local) -> *mut u8 {
+    unsafe fn recycle_allocate(&self, local: &Local) -> Option<NonNull<u8>> {
         debug_assert!(self.freed.len() >= self.catch_threshold);
 
         //  Safety:
         //  -   It is assumed that the current thread owns the LargePage, otherwise access to `local` is racy.
-        let list = ptr::NonNull::new_unchecked(self.freed.steal());
+        let list = self.freed.steal()?;
 
         //  Safety:
         //  -   Access to `list` is exclusive.
-        local.refill(CellLocal::from_atomic(list));
+        local.refill(BlockLocal::from_atomic(list));
 
         local.allocate()
     }
@@ -537,7 +553,7 @@ impl Adrift {
     //
     //  Returns the (new) current value.
     fn cast_adrift(&self) -> u64 {
-        let before = self.0.fetch_add(1, atomic::Ordering::AcqRel);
+        let before = self.0.fetch_add(1, Ordering::AcqRel);
         debug_assert!(before % 2 == 0, "before: {}", before);
 
         before + 1
@@ -547,117 +563,107 @@ impl Adrift {
     fn catch(&self, current: u64) -> bool { 
         debug_assert!(current % 2 != 0);
 
-        self.0.compare_exchange(current, current + 1, atomic::Ordering::AcqRel, atomic::Ordering::Relaxed).is_ok()
+        self.0.compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     }
 
     //  Internal: load.
-    fn load(&self) -> u64 { self.0.load(atomic::Ordering::Acquire) }
+    fn load(&self) -> u64 { self.0.load(Ordering::Acquire) }
 }
 
 impl Default for Adrift {
     fn default() -> Self { Self::new() }
 }
 
-//  largePagePtr
-struct LargePagePtr(atomic::AtomicPtr<LargePage>);
-
-impl LargePagePtr {
-    fn is_null(&self) -> bool { self.load().is_null() }
-
-    fn load(&self) -> *mut LargePage { self.0.load(atomic::Ordering::Acquire) }
-
-    fn store(&self, page: *mut LargePage) { self.0.store(page, atomic::Ordering::Release); }
-
-    //  Returns None if the exchange succeed, or the new current value otherwise.
-    fn exchange(&self, current: *mut LargePage, new: *mut LargePage) -> Option<*mut LargePage> {
-        self.0.compare_exchange(current, new, atomic::Ordering::AcqRel, atomic::Ordering::Acquire).err()
-    }
-}
-
-impl Default for LargePagePtr {
-    fn default() -> Self { Self(atomic::AtomicPtr::new(ptr::null_mut())) }
-}
-
 #[cfg(test)]
 mod tests {
 
-use core::{mem, ops, slice};
+use core::{
+    mem::{self, MaybeUninit},
+    ops,
+    slice,
+};
+
+use crate::internals::blocks::{BlockForeign, AtomicBlockForeign};
 
 use super::*;
-use crate::internals::cells::{CellForeign, CellAtomicForeign};
 
 const CELL_SIZE: usize = 32;
 
-struct CellStore([usize; 256]);
+struct BlockStore([usize; 256]);
 
-impl CellStore {
+impl BlockStore {
     const CAPACITY: usize = 256;
 
-    fn get(&self, index: usize) -> *mut usize { &self.0[index] as *const _ as *mut _ }
+    fn get(&self, index: usize) -> NonNull<u8> { NonNull::from(&self.0[index]).cast() }
 
-    /// Borrows self, outside of the compiler's overview.
-    unsafe fn create_local(&mut self, cell_size: usize) -> Local {
-        assert!(cell_size >= mem::size_of::<CellForeign>());
-
-        let (begin, end) = self.begin_end(cell_size);
-
-        Local::new(cell_size, begin, end)
+    fn end(&self) -> NonNull<u8> {
+        let pointer = unsafe { self.get(0).as_ptr().add(CELL_SIZE / 4 * BlockStore::CAPACITY) };
+        NonNull::new(pointer).unwrap()
     }
 
-    /// Creates a `CellForeignList` containing the specified range of cells.
+    /// Borrows self, outside of the compiler's overview.
+    unsafe fn create_local(&mut self, block_size: usize) -> Local {
+        assert!(block_size >= mem::size_of::<BlockForeign>());
+
+        let (begin, end) = self.begin_end(block_size);
+
+        Local::new(block_size, begin, end)
+    }
+
+    /// Creates a `BlockForeignList` containing the specified range of cells.
     ///
     /// #   Safety
     ///
     /// -   `local` should have been created from this instance.
     /// -   The cells should not _also_ be available through `local.next`.
-    unsafe fn create_foreign_list(&self, local: &Local, cells: ops::Range<usize>) -> CellForeignList {
-        assert!(cells.start <= cells.end);
+    unsafe fn create_foreign_list(&self, local: &Local, blocks: ops::Range<usize>) -> BlockForeignList {
+        assert!(blocks.start <= blocks.end);
 
-        let cell_size = local.cell_size;
+        let block_size = local.block_size;
 
-        let (begin, end) = self.begin_end(cell_size);
+        let (begin, end) = self.begin_end(block_size);
         assert_eq!(end, local.end);
-        assert!(cells.end <= (end as usize - begin as usize) / cell_size);
+        assert!(blocks.end <= (end.as_ptr() as usize - begin.as_ptr() as usize) / block_size);
 
-        let list = CellForeignList::default();
+        let list = BlockForeignList::default();
 
-        for index in cells.rev() {
-            let cell_address = begin.add(index * cell_size);
-            let cell = ptr::NonNull::new(cell_address as *mut CellForeign).unwrap();
-            list.push(cell);
+        for index in blocks.rev() {
+            let block_address = begin.as_ptr().add(index * block_size);
+            let block = NonNull::new(block_address as *mut BlockForeign).unwrap();
+            list.push(block);
         }
 
         list
     }
 
-    /// Creates a stack of `CellForeign` containing the specified range of cells.
+    /// Creates a stack of `BlockForeign` containing the specified range of blocks.
     ///
     /// #   Safety
     ///
     /// -   `local` should have been created from this instance.
-    /// -   The cells should not _also_ be available through `local.next`.
-    unsafe fn create_foreign_stack(&self, local: &Local, cells: ops::Range<usize>) -> ptr::NonNull<CellAtomicForeign> {
-        let list = self.create_foreign_list(local, cells);
+    /// -   The blocks should not _also_ be available through `local.next`.
+    unsafe fn create_foreign_stack(&self, local: &Local, blocks: ops::Range<usize>) -> NonNull<AtomicBlockForeign> {
+        let list = self.create_foreign_list(local, blocks);
 
-        let cell = CellAtomicForeignPtr::default();
-        cell.extend(&list);
+        let block = AtomicBlockForeignPtr::default();
+        block.extend(&list);
 
-        ptr::NonNull::new(cell.steal()).unwrap()
+        block.steal().unwrap()
     }
 
-    //  Internal: Compute begin and end for a given `cell_size`.
-    unsafe fn begin_end(&self, cell_size: usize) -> (*mut u8, *mut u8) {
+    //  Internal: Compute begin and end for a given `block_size`.
+    unsafe fn begin_end(&self, block_size: usize) -> (NonNull<u8>, NonNull<u8>) {
         let begin = self as *const Self as *mut Self as *mut u8;
         let end = begin.add(mem::size_of::<Self>());
 
-        let number_elements = (end as usize - begin as usize) / cell_size;
-        let begin = end.sub(number_elements * cell_size);
+        let number_elements = (end as usize - begin as usize) / block_size;
+        let begin = end.sub(number_elements * block_size);
 
-        (begin, end)
+        (NonNull::new(begin).unwrap(), NonNull::new(end).unwrap())
     }
 }
 
-impl Default for CellStore {
+impl Default for BlockStore {
     fn default() -> Self {
         let result: Self = unsafe { mem::zeroed() };
         assert_eq!(Self::CAPACITY, result.0.len());
@@ -677,22 +683,19 @@ fn implementation_sizes() {
 
 #[test]
 fn large_page_ptr() {
-    let null: *mut LargePage = ptr::null_mut();
-    let other: *mut LargePage = 1234usize as *mut _;
+    let other = NonNull::new(1234usize as *mut LargePage).unwrap();
 
-    let large_page = LargePagePtr::default();
-    assert!(large_page.is_null());
-    assert_eq!(null, large_page.load());
+    let large_page = AtomicPtr::default();
+    assert_eq!(None, large_page.load());
 
-    large_page.store(other);
-    assert!(!large_page.is_null());
-    assert_eq!(other, large_page.load());
+    large_page.store(Some(other));
+    assert_eq!(Some(other), large_page.load());
 
-    assert_eq!(Some(other), large_page.exchange(null, other));
-    assert_eq!(other, large_page.load());
+    assert_eq!(Err(Some(other)), large_page.compare_exchange(None, Some(other)));
+    assert_eq!(Some(other), large_page.load());
 
-    assert_eq!(None, large_page.exchange(other, null));
-    assert_eq!(null, large_page.load());
+    assert_eq!(Ok(Some(other)), large_page.compare_exchange(Some(other), None));
+    assert_eq!(None, large_page.load());
 }
 
 #[test]
@@ -715,160 +718,162 @@ fn adrift() {
 
 #[test]
 fn common_is_local_cell_pointer() {
-    let common = Common::new(ptr::null_mut(), ClassSize::new(0), 1, 0x40 as *mut u8, 0x60 as *mut u8);
+    fn pointer(x: usize) -> NonNull<u8> { NonNull::new(x as *mut u8).unwrap() }
 
-    assert!(!common.is_local_cell_pointer(0x3f as *mut u8));
+    let common = Common::new(ptr::null_mut(), ClassSize::new(0), 1, pointer(0x40), pointer(0x60));
+
+    assert!(!common.is_local_cell_pointer(pointer(0x3f)));
     
-    assert!(common.is_local_cell_pointer(0x40 as *mut u8));
-    assert!(common.is_local_cell_pointer(0x48 as *mut u8));
-    assert!(common.is_local_cell_pointer(0x50 as *mut u8));
-    assert!(common.is_local_cell_pointer(0x58 as *mut u8));
-    assert!(common.is_local_cell_pointer(0x5f as *mut u8));
+    assert!(common.is_local_cell_pointer(pointer(0x40)));
+    assert!(common.is_local_cell_pointer(pointer(0x48)));
+    assert!(common.is_local_cell_pointer(pointer(0x50)));
+    assert!(common.is_local_cell_pointer(pointer(0x58)));
+    assert!(common.is_local_cell_pointer(pointer(0x5f)));
 
-    assert!(!common.is_local_cell_pointer(0x60 as *mut u8));
+    assert!(!common.is_local_cell_pointer(pointer(0x60)));
 }
 
 #[test]
 fn local_new() {
-    //  This test actually tests `cell_store.create_local` more than anything.
+    //  This test actually tests `block_store.create_local` more than anything.
     //  Since further tests will depend on it correctly initializing `Local`, it is better to validate it early.
-    let mut cell_store = CellStore::default();
-    let end_store = cell_store.get(0) as usize + CELL_SIZE / 4 * CellStore::CAPACITY;
+    let mut block_store = BlockStore::default();
+    let end_store = block_store.end();
 
     {
-        let local = unsafe { cell_store.create_local(CELL_SIZE * 2) };
-        assert_eq!(cell_store.get(0) as usize, local.next.peek().unwrap().as_ptr() as usize);
-        assert_eq!(cell_store.get(8) as usize, local.watermark.get() as usize);
-        assert_eq!(end_store, local.end as usize);
+        let local = unsafe { block_store.create_local(CELL_SIZE * 2) };
+        assert_eq!(block_store.get(0), local.next.peek().unwrap().cast());
+        assert_eq!(block_store.get(8), local.watermark.get());
+        assert_eq!(end_store, local.end);
     }
 
     {
-        let local = unsafe { cell_store.create_local(CELL_SIZE * 2 + CELL_SIZE / 2) };
-        assert_eq!(cell_store.get(6) as usize, local.next.peek().unwrap().as_ptr() as usize);
-        assert_eq!(cell_store.get(16) as usize, local.watermark.get() as usize);
-        assert_eq!(end_store, local.end as usize);
+        let local = unsafe { block_store.create_local(CELL_SIZE * 2 + CELL_SIZE / 2) };
+        assert_eq!(block_store.get(6), local.next.peek().unwrap().cast());
+        assert_eq!(block_store.get(16), local.watermark.get());
+        assert_eq!(end_store, local.end);
     }
 }
 
 #[test]
 fn local_allocate_expansion() {
-    let mut cell_store = CellStore::default();
-    let local = unsafe { cell_store.create_local(CELL_SIZE) };
+    let mut block_store = BlockStore::default();
+    let local = unsafe { block_store.create_local(CELL_SIZE) };
 
     //  Bump watermark until it is no longer possible.
     for i in 0..64 {
-        assert_eq!(cell_store.get(4 * i) as usize, local.allocate() as usize);
+        assert_eq!(block_store.get(4 * i), local.allocate().unwrap());
     }
 
     assert_eq!(local.end, local.watermark.get());
 
-    assert_eq!(ptr::null_mut(), local.allocate());
+    assert_eq!(None, local.allocate());
 }
 
 #[test]
 fn local_allocate_deallocate_ping_pong() {
-    let mut cell_store = CellStore::default();
-    let local = unsafe { cell_store.create_local(CELL_SIZE) };
+    let mut block_store = BlockStore::default();
+    let local = unsafe { block_store.create_local(CELL_SIZE) };
 
     let ptr = local.allocate();
 
     for _ in 0..10 {
-        unsafe { local.deallocate(ptr) };
+        unsafe { local.deallocate(ptr.unwrap()) };
         assert_eq!(ptr, local.allocate());
     }
 
-    assert_eq!(cell_store.get(4) as usize, local.watermark.get() as usize);
+    assert_eq!(block_store.get(4), local.watermark.get());
 }
 
 #[test]
 fn local_extend() {
-    let mut cell_store = CellStore::default();
-    let local = unsafe { cell_store.create_local(CELL_SIZE) };
+    let mut block_store = BlockStore::default();
+    let local = unsafe { block_store.create_local(CELL_SIZE) };
 
     //  Allocate all.
-    while !local.allocate().is_null() {}
+    while let Some(_) = local.allocate() {}
 
-    let foreign_list = unsafe { cell_store.create_foreign_list(&local, 3..7) };
+    let foreign_list = unsafe { block_store.create_foreign_list(&local, 3..7) };
 
     unsafe { local.extend(&foreign_list) };
     assert!(foreign_list.is_empty());
 
     for i in 3..7 {
-        assert_eq!(cell_store.get(4 * i) as usize, local.allocate() as usize);
+        assert_eq!(block_store.get(4 * i), local.allocate().unwrap());
     }
 }
 
 #[test]
 fn local_refill() {
-    let mut cell_store = CellStore::default();
-    let local = unsafe { cell_store.create_local(CELL_SIZE) };
+    let mut block_store = BlockStore::default();
+    let local = unsafe { block_store.create_local(CELL_SIZE) };
 
     //  Allocate all.
-    while !local.allocate().is_null() {}
+    while let Some(_) = local.allocate() {}
 
-    let foreign = unsafe { cell_store.create_foreign_stack(&local, 3..7) };
+    let foreign = unsafe { block_store.create_foreign_stack(&local, 3..7) };
 
-    unsafe { local.refill(CellLocal::from_atomic(foreign)) };
+    unsafe { local.refill(BlockLocal::from_atomic(foreign)) };
 
     for i in 3..7 {
-        assert_eq!(cell_store.get(4 * i) as usize, local.allocate() as usize);
+        assert_eq!(block_store.get(4 * i), local.allocate().unwrap());
     }
 }
 
 #[test]
 fn foreign_refill() {
-    let mut cell_store = CellStore::default();
-    let local = unsafe { cell_store.create_local(CELL_SIZE) };
+    let mut block_store = BlockStore::default();
+    let local = unsafe { block_store.create_local(CELL_SIZE) };
 
     //  Allocate all.
-    while !local.allocate().is_null() {}
+    while let Some(_) = local.allocate() {}
 
     let foreign = Foreign::new(16);
 
     //  Insufficient number of elements.
-    let list = unsafe { cell_store.create_foreign_list(&local, 3..7) };
+    let list = unsafe { block_store.create_foreign_list(&local, 3..7) };
     assert!(unsafe { !foreign.refill(&list) });
 
     //  Sufficient number, but not adrift.
-    let list = unsafe { cell_store.create_foreign_list(&local, 7..32) };
+    let list = unsafe { block_store.create_foreign_list(&local, 7..32) };
     assert!(unsafe { !foreign.refill(&list) });
 
     //  Number already sufficient, and now was adrift.
     foreign.adrift.cast_adrift();
     assert_eq!(Some(1), foreign.adrift.is_adrift());
 
-    let list = unsafe { cell_store.create_foreign_list(&local, 0..3) };
+    let list = unsafe { block_store.create_foreign_list(&local, 0..3) };
     assert!(unsafe { foreign.refill(&list) });
 }
 
 #[test]
 fn foreign_allocate() {
-    let mut cell_store = CellStore::default();
-    let local = unsafe { cell_store.create_local(CELL_SIZE) };
+    let mut block_store = BlockStore::default();
+    let local = unsafe { block_store.create_local(CELL_SIZE) };
 
     //  Allocate all.
-    while !local.allocate().is_null() {}
+    while let Some(_) = local.allocate() {}
 
     let foreign = Foreign::new(16);
 
     //  Enough elements, immediate recycling.
-    let list = unsafe { cell_store.create_foreign_list(&local, 0..32) };
+    let list = unsafe { block_store.create_foreign_list(&local, 0..32) };
     assert!(unsafe { !foreign.refill(&list) });
 
-    assert_eq!(cell_store.get(0) as usize, unsafe { foreign.allocate(&local) } as usize);
+    assert_eq!(block_store.get(0), unsafe { foreign.allocate(&local).unwrap() });
 
     //  Local was refilled with 32 elements (one already consumed above).
     for i in 1..32 {
-        assert_eq!(cell_store.get(4 * i) as usize, local.allocate() as usize);
+        assert_eq!(block_store.get(4 * i), local.allocate().unwrap());
     }
 
-    assert_eq!(ptr::null_mut(), local.allocate());
+    assert_eq!(None, local.allocate());
 
     //  Not enough elements, cast the page adrift.
-    let list = unsafe { cell_store.create_foreign_list(&local, 32..40) };
+    let list = unsafe { block_store.create_foreign_list(&local, 32..40) };
     assert!(unsafe { !foreign.refill(&list) });
 
-    assert_eq!(ptr::null_mut(), unsafe { foreign.allocate(&local) });
+    assert_eq!(None, unsafe { foreign.allocate(&local) });
     assert_eq!(Some(1), foreign.adrift.is_adrift());
 
     //  The race-condition cannot be tested in single-threaded code.
@@ -886,7 +891,7 @@ impl Configuration for TestConfiguration {
 struct LargePageStore([usize; 256]);
 
 impl LargePageStore {
-    unsafe fn initialize(&mut self, class_size: ClassSize) -> *mut LargePage {
+    unsafe fn initialize(&mut self, class_size: ClassSize) -> NonNull<LargePage> {
         let start = self.address() as *mut u8;
         let size = mem::size_of::<Self>();
 
@@ -897,20 +902,20 @@ impl LargePageStore {
         LargePage::initialize::<TestConfiguration>(place, self.address(), class_size)
     }
 
-    fn create_foreign_list(&self, large_page: &LargePage, cells: ops::Range<usize>) -> CellForeignList {
+    fn create_foreign_list(&self, large_page: &LargePage, blocks: ops::Range<usize>) -> BlockForeignList {
         assert_eq!(self.address(), large_page.owner());
 
-        let cell_size = large_page.local.cell_size;
+        let block_size = large_page.local.block_size;
         let (begin, end) = (large_page.common.begin, large_page.common.end);
 
-        assert!(cells.end * cell_size <= (end as usize - begin as usize));
+        assert!(blocks.end * block_size <= (end.as_ptr() as usize - begin.as_ptr() as usize));
 
-        let list = CellForeignList::default();
+        let list = BlockForeignList::default();
 
-        for index in cells.rev() {
-            let cell_address = unsafe { begin.add(index * cell_size) };
-            let cell = ptr::NonNull::new(cell_address as *mut CellForeign).unwrap();
-            list.push(cell);
+        for index in blocks.rev() {
+            let block_address = unsafe { begin.as_ptr().add(index * block_size) };
+            let block = NonNull::new(block_address as *mut BlockForeign).unwrap();
+            list.push(block);
         }
 
         list
@@ -918,9 +923,9 @@ impl LargePageStore {
 
     fn address(&self) -> *mut () { self as *const Self as *mut Self as *mut () }
 
-    fn inner_pointer(&self) -> *mut u8 {
+    fn inner_pointer(&self) -> NonNull<u8> {
         let base_ptr = self.address() as *mut u8;
-        unsafe { base_ptr.add(mem::size_of::<Self>() / 2) }
+        NonNull::new(unsafe { base_ptr.add(mem::size_of::<Self>() / 2) }).unwrap()
     }
 }
 
@@ -934,7 +939,7 @@ fn large_page_initialize_from_raw() {
 
     let class_size = ClassSize::new(4);
     let large_page_ptr = unsafe { store.initialize(class_size) };
-    let large_page = unsafe { &*large_page_ptr };
+    let large_page = unsafe { large_page_ptr.as_ref() };
 
     assert_eq!(store.address(), large_page.owner());
     assert_eq!(class_size, large_page.class_size());
@@ -950,10 +955,10 @@ fn large_page_allocate_deallocate_local() {
     let mut store = LargePageStore::default();
 
     let large_page_ptr = unsafe { store.initialize(ClassSize::new(4)) };
-    let large_page = unsafe { &*large_page_ptr };
+    let large_page = unsafe { large_page_ptr.as_ref() };
 
-    let cell_size = large_page.local.cell_size;
-    assert_eq!(64, cell_size);
+    let block_size = large_page.local.block_size;
+    assert_eq!(64, block_size);
 
     let mut last = 0usize;
     let mut counter = 0;
@@ -961,14 +966,14 @@ fn large_page_allocate_deallocate_local() {
     loop {
         let new = unsafe { large_page.allocate() };
 
-        if new.is_null() {
+        if new.is_none() {
             break;
         }
 
-        let new = new as usize;
+        let new = new.unwrap().as_ptr() as usize;
 
         if last != 0 {
-            assert_eq!(last + cell_size, new);
+            assert_eq!(last + block_size, new);
         }
 
         last = new;
@@ -979,8 +984,8 @@ fn large_page_allocate_deallocate_local() {
     assert_eq!(Some(1), large_page.foreign.adrift.is_adrift());
 
     for _ in 0..counter {
-        unsafe { large_page.deallocate(last as *mut u8) };
-        last -= cell_size;
+        unsafe { large_page.deallocate(NonNull::new(last as *mut u8).unwrap()) };
+        last -= block_size;
     }
 
     assert!(large_page.foreign.adrift.catch(1));
@@ -988,13 +993,13 @@ fn large_page_allocate_deallocate_local() {
     for _ in 0..counter {
         let new = unsafe { large_page.allocate() };
 
-        assert_ne!(ptr::null_mut(), new);
-        assert_eq!(last + cell_size, new as usize);
+        assert_ne!(None, new);
+        assert_eq!(last + block_size, new.unwrap().as_ptr() as usize);
 
-        last += cell_size;
+        last += block_size;
     }
 
-    assert_eq!(ptr::null_mut(), unsafe { large_page.allocate() });
+    assert_eq!(None, unsafe { large_page.allocate() });
     assert_eq!(Some(3), large_page.foreign.adrift.is_adrift());
 }
 
@@ -1003,13 +1008,13 @@ fn large_page_refill_local() {
     let mut store = LargePageStore::default();
 
     let large_page_ptr = unsafe { store.initialize(ClassSize::new(4)) };
-    let large_page = unsafe { &*large_page_ptr };
+    let large_page = unsafe { large_page_ptr.as_ref() };
 
     //  Allocate a few from local.
     let mut allocated: [usize; 12] = Default::default();
 
     for i in 0..12 {
-        allocated[i] = unsafe { large_page.allocate() } as usize;
+        allocated[i] = unsafe { large_page.allocate() }.unwrap().as_ptr() as usize;
     }
 
     //  Refill.
@@ -1021,7 +1026,7 @@ fn large_page_refill_local() {
 
     //  New allocated pointers match previous allocated ones.
     for i in 6..12 {
-        let new = unsafe { large_page.allocate() } as usize;
+        let new = unsafe { large_page.allocate() }.unwrap().as_ptr() as usize;
         assert_eq!(allocated[i], new);
     }
 }
@@ -1032,13 +1037,13 @@ fn large_page_refill_local_skip() {
     let mut other_store = LargePageStore::default();
 
     let large_page_ptr = unsafe { store.initialize(ClassSize::new(4)) };
-    let large_page = unsafe { &*large_page_ptr };
+    let large_page = unsafe { large_page_ptr.as_ref() };
 
     let other_page_ptr = unsafe { other_store.initialize(ClassSize::new(4)) };
-    let other_page = unsafe { &*other_page_ptr };
+    let other_page = unsafe { other_page_ptr.as_ref() };
 
     //  Allocate one from local as a reference.
-    let allocated = unsafe { large_page.allocate() } as usize;
+    let allocated = unsafe { large_page.allocate() }.unwrap().as_ptr() as usize;
 
     //  Attempt refill from cells from another LargePage, it should be skipped.
     let other_list = other_store.create_foreign_list(other_page, 0..6);
@@ -1048,7 +1053,7 @@ fn large_page_refill_local_skip() {
     assert_eq!(6, other_list.len());
 
     //  The next allocated pointer is as expected.
-    assert_eq!(allocated + large_page.local.cell_size, unsafe { large_page.allocate() } as usize);
+    assert_eq!(allocated + large_page.local.block_size, unsafe { large_page.allocate() }.unwrap().as_ptr() as usize);
 }
 
 #[test]
@@ -1056,13 +1061,13 @@ fn large_page_refill_foreign_not_adrift() {
     let mut store = LargePageStore::default();
 
     let large_page_ptr = unsafe { store.initialize(ClassSize::new(4)) };
-    let large_page = unsafe { &*large_page_ptr };
+    let large_page = unsafe { large_page_ptr.as_ref() };
 
     //  Allocate a few from local.
     let mut allocated: [usize; 12] = Default::default();
 
     for i in 0..12 {
-        allocated[i] = unsafe { large_page.allocate() } as usize;
+        allocated[i] = unsafe { large_page.allocate() }.unwrap().as_ptr() as usize;
     }
 
     //  Refill.
@@ -1079,7 +1084,7 @@ fn large_page_refill_foreign_not_adrift() {
 
     //  Then switch to refilled pointers.
     for i in 6..12 {
-        let new = unsafe { large_page.allocate() } as usize;
+        let new = unsafe { large_page.allocate() }.unwrap().as_ptr() as usize;
         assert_eq!(allocated[i], new);
     }
 }
@@ -1089,17 +1094,17 @@ fn large_page_refill_foreign_adrift() {
     let mut store = LargePageStore::default();
 
     let large_page_ptr = unsafe { store.initialize(ClassSize::new(4)) };
-    let large_page = unsafe { &*large_page_ptr };
+    let large_page = unsafe { large_page_ptr.as_ref() };
     assert_eq!(6, large_page.foreign.catch_threshold);
 
     //  Empty local.
     let mut allocated: [usize; 24] = Default::default();
 
     for i in 0..24 {
-        allocated[i] = unsafe { large_page.allocate() } as usize;
+        allocated[i] = unsafe { large_page.allocate() }.unwrap().as_ptr() as usize;
     }
 
-    assert_eq!(ptr::null_mut(), unsafe { large_page.allocate() });
+    assert_eq!(None, unsafe { large_page.allocate() });
     assert_eq!(Some(1), large_page.foreign.adrift.is_adrift());
 
     //  Refill.
@@ -1114,25 +1119,25 @@ fn large_page_refill_foreign_adrift() {
     assert_eq!(Some(1), large_page.foreign.adrift.is_adrift());
 
     //  Refill with enough supplementary elements.
-    let mut caught: *mut LargePage = ptr::null_mut();
+    let mut caught: Option<NonNull<LargePage>> = None;
     let caught = &mut caught;
 
     let list = store.create_foreign_list(large_page, 0..3);
-    unsafe { large_page.refill_foreign(&list, |c| *caught = c) };
+    unsafe { large_page.refill_foreign(&list, |c| *caught = Some(c)) };
     
     //  The list was consumed.
     assert_eq!(0, list.len());
     assert_eq!(6, large_page.foreign.freed.len());
 
     //  The page was recycled.
-    assert_eq!(large_page_ptr, *caught);
+    assert_eq!(large_page_ptr, caught.unwrap());
 
     //  The page is no longer adrift.
     assert_eq!(None, large_page.foreign.adrift.is_adrift());
 
     //  Allocating works again!
     for i in 0..6 {
-        let new = unsafe { large_page.allocate() } as usize;
+        let new = unsafe { large_page.allocate() }.unwrap().as_ptr() as usize;
         assert_eq!(allocated[i], new);
     }
 }
@@ -1144,27 +1149,27 @@ fn large_page_stack() {
     let mut stores = [LargePageStore::default(); 6];
 
     let pointers = {
-        let mut result: [*mut LargePage; 6] = unsafe { mem::zeroed() };
+        let mut result: MaybeUninit<[NonNull<LargePage>; 6]> = MaybeUninit::uninit();
 
         for i in 0..6 {
-            result[i] = unsafe { stores[i].initialize(class_size) };
+            unsafe { (*result.as_mut_ptr())[i] = stores[i].initialize(class_size) };
         }
 
-        result
+        unsafe { result.assume_init() }
     };
 
     let stack = LargePageStack::default();
-    assert_eq!(ptr::null_mut(), unsafe { stack.pop() });
+    assert_eq!(None, unsafe { stack.pop() });
 
     for large_page in pointers.iter().rev() {
         unsafe { stack.push(*large_page) };
     }
 
     for large_page in pointers.iter() {
-        assert_eq!(*large_page, unsafe { stack.pop() });
+        assert_eq!(Some(*large_page), unsafe { stack.pop() });
     }
 
-    assert_eq!(ptr::null_mut(), unsafe { stack.pop() });
+    assert_eq!(None, unsafe { stack.pop() });
 }
 
 }

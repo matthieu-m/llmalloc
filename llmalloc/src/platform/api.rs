@@ -1,5 +1,7 @@
 //! API of OS required services.
 
+use core::ptr::NonNull;
+
 pub use llmalloc_core::Configuration;
 
 /// Abstraction over OS services.
@@ -17,14 +19,14 @@ pub(crate) trait ThreadLocal<T> {
     /// Returns a pointer to the thread-local value associated to this instance.
     ///
     /// May return a null pointer if no prior value was set, or it was already destructed.
-    fn get(&self) -> *mut T;
+    fn get(&self) -> Option<NonNull<T>>;
 
     /// Sets the pointer to the thread-local value associated to this instance.
     ///
     /// #   Safety
     ///
     /// -   Assumes that the value is not already set.
-    fn set(&self, value: *mut T);
+    fn set(&self, value: NonNull<T>);
 }
 
 /// Index of a NUMA node.

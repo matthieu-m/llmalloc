@@ -3,7 +3,10 @@
 //! The Platform trait is used to request memory directly from the Platform. By abstracting the underlying platform,
 //! it becomes possible to easily port the code to a different OS, or even to a bare-metal target.
 
-use core::alloc::Layout;
+use core::{
+    alloc::Layout,
+    ptr::NonNull,
+};
 
 /// Abstraction of platform specific memory allocation and deallocation.
 pub trait Platform {
@@ -20,7 +23,7 @@ pub trait Platform {
     /// `allocate` assumes that:
     /// -   `layout.size()` is a multiple of `layout.align()`.
     /// -   `layout.align()` is non-zero, and is a power of 2.
-    unsafe fn allocate(&self, layout: Layout) -> *mut u8;
+    unsafe fn allocate(&self, layout: Layout) -> Option<NonNull<u8>>;
 
     /// Deallocates the supplied block of memory.
     ///
@@ -31,5 +34,5 @@ pub trait Platform {
     /// `deallocate` assumes that:
     /// -   `pointer` was allocated by this instance of `Platform`, with `layout` as argument.
     /// -   `pointer` is the value returned by `Plaform`, and not an interior pointer.
-    unsafe fn deallocate(&self, pointer: *mut u8, layout: Layout);
+    unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout);
 }

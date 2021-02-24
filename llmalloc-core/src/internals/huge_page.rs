@@ -5,7 +5,15 @@
 //!
 //! A `SocketLocal` may own multiple 
 
-use core::{alloc::Layout, cmp, mem, num, ptr, slice, sync::atomic};
+use core::{
+    alloc::Layout,
+    cmp,
+    mem,
+    num,
+    ptr::{self, NonNull},
+    slice,
+    sync::atomic::{self, AtomicU8, AtomicU64, Ordering},
+};
 
 use crate::{Configuration, PowerOf2};
 use crate::utils;
@@ -29,15 +37,16 @@ impl HugePage {
     ///
     /// -   Assumes that there is sufficient memory available.
     /// -   Assumes that the pointer is correctly aligned.
-    pub(crate) unsafe fn initialize<C>(place: &mut [u8], owner: *mut ()) -> *mut Self
+    pub(crate) unsafe fn initialize<C>(place: &mut [u8], owner: *mut ()) -> NonNull<Self>
         where
             C: Configuration,
     {
         debug_assert!(place.len() >= C::HUGE_PAGE_SIZE.value());
 
-        let at = place.as_mut_ptr();
+        //  Safety:
+        //  -   `place` is not a null size.
+        let at = NonNull::new_unchecked(place.as_mut_ptr());
 
-        debug_assert!(!at.is_null());
         debug_assert!(utils::is_sufficiently_aligned_for(at, C::HUGE_PAGE_SIZE));
         debug_assert!(mem::size_of::<Self>() <= C::LARGE_PAGE_SIZE.value());
 
@@ -45,14 +54,14 @@ impl HugePage {
         //  -   `at` is assumed to be sufficiently sized.
         //  -   `at` is assumed to be sufficiently aligned.
         #[allow(clippy::cast_ptr_alignment)]
-        let huge_page = at as *mut Self;
+        let huge_page = at.as_ptr() as *mut Self;
 
         ptr::write(huge_page, HugePage::new::<C>(owner));
 
         //  Enforce memory ordering, later Acquire need to see those 0s and 1s.
-        atomic::fence(atomic::Ordering::Release);
+        atomic::fence(Ordering::Release);
 
-        huge_page
+        at.cast()
     }
 
     /// Obtain the huge page associated to a given allocation.
@@ -60,22 +69,24 @@ impl HugePage {
     /// #   Safety
     ///
     /// -   Assumes that the pointer is pointing strictly _inside_ a HugePage.
-    pub(crate) unsafe fn from_raw<C>(ptr: *mut u8) -> *mut HugePage
+    pub(crate) unsafe fn from_raw<C>(ptr: NonNull<u8>) -> NonNull<HugePage>
         where
             C: Configuration,
     {
         debug_assert!(!utils::is_sufficiently_aligned_for(ptr, C::HUGE_PAGE_SIZE));
 
-        let address = ptr as usize;
+        let address = ptr.as_ptr() as usize;
         let huge_page = C::HUGE_PAGE_SIZE.round_down(address);
 
-        huge_page as *mut HugePage
+        //  Safety:
+        //  -   `ptr` was not null
+        NonNull::new_unchecked(huge_page as *mut HugePage)
     }
 
     /// Allocate one or more LargePages from this page, if any.
     ///
     /// Returns a null pointer if the allocation cannot be fulfilled.
-    pub(crate) unsafe fn allocate(&self, layout: Layout) -> *mut u8 {
+    pub(crate) unsafe fn allocate(&self, layout: Layout) -> Option<NonNull<u8>> {
         debug_assert!(layout.align().count_ones() == 1, "{} is not a power of 2", layout.align());
 
         let large_page_size = self.common.page_size;
@@ -90,9 +101,9 @@ impl HugePage {
         debug_assert!(align_pages.value() > 0);
 
         if let Some(index) = self.foreign.allocate(NumberPages(number_pages), align_pages) {
-            self.address().add(index.value() * large_page_size)
+            NonNull::new(self.address().add(index.value() * large_page_size))
         } else {
-            ptr::null_mut()
+            None
         }
     }
 
@@ -102,10 +113,10 @@ impl HugePage {
     ///
     /// -   Assumes that the pointer is pointing to a `LargePage` inside _this_ `HugePage`.
     /// -   Assumes that the pointed page is no longer in use.
-    pub(crate) unsafe fn deallocate(&self, ptr: *mut u8) {
+    pub(crate) unsafe fn deallocate(&self, ptr: NonNull<u8>) {
         debug_assert!(utils::is_sufficiently_aligned_for(ptr, self.common.page_size));
 
-        let index = (ptr as usize - self.address() as usize) / self.common.page_size;
+        let index = (ptr.as_ptr() as usize - self.address() as usize) / self.common.page_size;
         debug_assert!(index > 0 && index <= self.common.number_pages.0);
 
         //  Safety:
@@ -533,7 +544,7 @@ impl PageTokens {
 //  -   The fast case of single-page allocation need not register the size, as the array is initialized with 0s,
 //      and deallocation restores 0.
 //  -   Very large allocation sizes of 257 or more can be represented with only 2 u8s: 256 + 255 == 511.
-struct PageSizes([atomic::AtomicU8; 512]);
+struct PageSizes([AtomicU8; 512]);
 
 impl PageSizes {
     /// Returns the number of pages from a particular index.
@@ -545,12 +556,12 @@ impl PageSizes {
         let index = index.value();
         debug_assert!(index < self.0.len());
 
-        let number_pages = self.0.get_unchecked(index).load(atomic::Ordering::Acquire) as usize;
+        let number_pages = self.0.get_unchecked(index).load(Ordering::Acquire) as usize;
 
         if number_pages == 255 {
             debug_assert!(index + 1 < self.0.len());
             //  No implicit +1 on overflow size.
-            NumberPages(256 + self.0.get_unchecked(index + 1).load(atomic::Ordering::Acquire) as usize)
+            NumberPages(256 + self.0.get_unchecked(index + 1).load(Ordering::Acquire) as usize)
         } else {
             //  Implicit +1
             NumberPages(number_pages + 1)
@@ -572,13 +583,13 @@ impl PageSizes {
 
         if number_pages.0 <= 256 {
             let number_pages = (number_pages.0 - 1) as u8;
-            self.0.get_unchecked(index).store(number_pages, atomic::Ordering::Release);
+            self.0.get_unchecked(index).store(number_pages, Ordering::Release);
         } else {
             let overflow = number_pages.0 - 256;
             debug_assert!(overflow <= (u8::MAX as usize));
 
-            self.0.get_unchecked(index).store(255, atomic::Ordering::Release);
-            self.0.get_unchecked(index + 1).store(overflow as u8, atomic::Ordering::Release);
+            self.0.get_unchecked(index).store(255, Ordering::Release);
+            self.0.get_unchecked(index + 1).store(overflow as u8, Ordering::Release);
         }
     }
 
@@ -592,12 +603,12 @@ impl PageSizes {
         let index = index.value();
         debug_assert!(index < self.0.len());
 
-        self.0.get_unchecked(index).store(0, atomic::Ordering::Release);
+        self.0.get_unchecked(index).store(0, Ordering::Release);
 
         if number_pages.0 > 256 {
-            debug_assert!(self.0[index + 1].load(atomic::Ordering::Acquire) > 0);
+            debug_assert!(self.0[index + 1].load(Ordering::Acquire) > 0);
 
-            self.0.get_unchecked(index + 1).store(0, atomic::Ordering::Release);
+            self.0.get_unchecked(index + 1).store(0, Ordering::Release);
         }
     }
 }
@@ -606,7 +617,7 @@ impl Default for PageSizes {
     fn default() -> Self { unsafe { mem::zeroed() } }
 }
 
-struct BitMask(atomic::AtomicU64);
+struct BitMask(AtomicU64);
 
 impl BitMask {
     //  Safety:
@@ -614,20 +625,20 @@ impl BitMask {
     const CAPACITY: PowerOf2 = unsafe { PowerOf2::new_unchecked(64) };
 
     /// Initializes the BitMask with the given mask.
-    fn initialize(&self, mask: u64) { self.0.store(mask, atomic::Ordering::Relaxed); }
+    fn initialize(&self, mask: u64) { self.0.store(mask, Ordering::Relaxed); }
 
     /// Claims a 0 bit, returns its index or None if all bits are claimed.
     fn claim_single(&self) -> Option<usize> {
         loop {
             //  Locate first 0 bit.
-            let current_mask = self.0.load(atomic::Ordering::Acquire);
+            let current_mask = self.0.load(Ordering::Acquire);
             let candidate = (!current_mask).trailing_zeros() as usize;
 
             //  All bits are ones, move on.
             if candidate == Self::capacity() { return None; }
 
             let candidate_mask = 1u64 << candidate;
-            let before = self.0.fetch_or(candidate_mask, atomic::Ordering::AcqRel);
+            let before = self.0.fetch_or(candidate_mask, Ordering::AcqRel);
 
             //  This thread claimed the bit first, victory!
             if before & candidate_mask == 0 {
@@ -648,7 +659,7 @@ impl BitMask {
 
         loop {
             //  Locate last 0 bit.
-            let current_mask = self.0.load(atomic::Ordering::Acquire) | progress_mask;
+            let current_mask = self.0.load(Ordering::Acquire) | progress_mask;
 
             //  Potential number of available bits.
             let potential = Self::capacity() - (!current_mask).leading_zeros() as usize;
@@ -673,7 +684,7 @@ impl BitMask {
 
         //  Claim as many low-bits as possible, as long as they are aligned.
         {
-            let current_mask = self.0.load(atomic::Ordering::Acquire);
+            let current_mask = self.0.load(Ordering::Acquire);
 
             let potential = align.round_down(current_mask.trailing_zeros() as usize);
 
@@ -725,7 +736,7 @@ impl BitMask {
     //
     //  On failure, unclaims bits that were erroneously claimed.
     fn claim(&self, mask: u64) -> bool {
-        let before = self.0.fetch_or(mask, atomic::Ordering::AcqRel);
+        let before = self.0.fetch_or(mask, Ordering::AcqRel);
 
         //  Success!
         if before & mask == 0 {
@@ -748,7 +759,7 @@ impl BitMask {
 
     //  Internal: Releases the bits.
     fn release(&self, mask: u64) {
-        let _before = self.0.fetch_and(!mask, atomic::Ordering::AcqRel);
+        let _before = self.0.fetch_and(!mask, Ordering::AcqRel);
         debug_assert!(_before & mask == mask);
     }
 
@@ -775,13 +786,13 @@ impl BitMask {
 impl Clone for BitMask {
     fn clone(&self) -> Self {
         let result = BitMask::default();
-        result.initialize(self.0.load(atomic::Ordering::Relaxed));
+        result.initialize(self.0.load(Ordering::Relaxed));
         result
     }
 }
 
 impl Default for BitMask {
-    fn default() -> Self { Self(atomic::AtomicU64::new(0)) }
+    fn default() -> Self { Self(AtomicU64::new(0)) }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -844,7 +855,7 @@ fn page_index_new_unchecked() {
     assert_eq!(1023, new(1023));
 }
 
-fn load_bitmask(bitmask: &BitMask) -> u64 { bitmask.0.load(atomic::Ordering::Relaxed) }
+fn load_bitmask(bitmask: &BitMask) -> u64 { bitmask.0.load(Ordering::Relaxed) }
 
 #[test]
 fn bitmask_initialize() {
@@ -1511,10 +1522,11 @@ fn huge_page_smoke_test() {
     let mut raw: mem::MaybeUninit<AlignedPage> = mem::MaybeUninit::uninit();
     let slice = unsafe { slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, mem::size_of::<AlignedPage>()) };
 
-    let huge_page_ptr = unsafe { HugePage::initialize::<TestConfiguration>(slice, ptr::null_mut()) };
-    assert_eq!(slice.as_mut_ptr(), huge_page_ptr as *mut u8);
+    let mut huge_page = unsafe { HugePage::initialize::<TestConfiguration>(slice, ptr::null_mut()) };
+    let huge_page_ptr = huge_page.as_ptr() as *mut u8;
+    assert_eq!(slice.as_mut_ptr(), huge_page_ptr);
 
-    let huge_page = unsafe { &mut *huge_page_ptr };
+    let huge_page = unsafe { huge_page.as_mut() };
     assert_eq!(huge_page_ptr as usize, huge_page.address() as usize);
 
     assert_eq!(ptr::null_mut(), huge_page.owner());
@@ -1525,7 +1537,7 @@ fn huge_page_smoke_test() {
     {
         let buffer = huge_page.buffer_mut();
 
-        let start_ptr = huge_page_ptr as *mut u8 as usize;
+        let start_ptr = huge_page_ptr as usize;
         let buffer_ptr = buffer.as_mut_ptr() as usize;
 
         assert_eq!(HUGE_HEADER_SIZE, buffer_ptr - start_ptr);
@@ -1534,16 +1546,16 @@ fn huge_page_smoke_test() {
 
     let layout = Layout::from_size_align(LARGE_PAGE_SIZE + 1, 1).expect("Proper layout");
     let allocated = unsafe { huge_page.allocate(layout) };
-    assert_ne!(ptr::null_mut(), allocated);
+    assert_ne!(None, allocated);
 
-    let retrieved = unsafe { HugePage::from_raw::<TestConfiguration>(allocated) };
-    assert_eq!(huge_page_ptr, retrieved);
+    let retrieved = unsafe { HugePage::from_raw::<TestConfiguration>(allocated.unwrap()) };
+    assert_eq!(huge_page_ptr, retrieved.as_ptr() as *mut u8);
 
     let layout = Layout::from_size_align(LARGE_PAGE_SIZE * 14, 1).expect("Proper layout");
     let failed = unsafe { huge_page.allocate(layout) };
-    assert_eq!(ptr::null_mut(), failed);
+    assert_eq!(None, failed);
 
-    unsafe { huge_page.deallocate(allocated) };
+    unsafe { huge_page.deallocate(allocated.unwrap()) };
 }
 
 }

@@ -1,4 +1,13 @@
-use std::{alloc::Layout, collections, ops, sync::{self, atomic}, thread};
+use std::{
+    alloc::Layout,
+    collections::BTreeSet,
+    env,
+    mem,
+    ops::{Deref, DerefMut},
+    ptr::{self, NonNull},
+    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}},
+    thread::{self, JoinHandle},
+};
 
 use serial_test::serial;
 
@@ -18,7 +27,7 @@ fn acquire_release_thread_handles() {
     let number_iterations = number_iterations();
     let number_threads = number_threads();
 
-    let mut thread_handles = collections::BTreeSet::new();
+    let mut thread_handles = BTreeSet::new();
 
     for _ in 0..number_iterations {
         let start = RendezVous::new("start", number_threads);
@@ -45,7 +54,7 @@ fn acquire_release_thread_handles() {
         let results = pool.join();
 
         //  Ensure that no 2 threads obtained the same thread-local handle.
-        let local_handles: collections::BTreeSet<_> = results.iter().cloned().collect();
+        let local_handles: BTreeSet<_> = results.iter().cloned().collect();
 
         assert_eq!(number_threads, local_handles.len());
 
@@ -93,7 +102,7 @@ fn producer_consumer_ring() {
     }
 
     #[inline(never)]
-    fn shuffle_ring(ring: &[sync::Mutex<Vec<Pointer<String>>>]) {
+    fn shuffle_ring(ring: &[Mutex<Vec<Pointer<String>>>]) {
         fn swap_head(vec: &mut Vec<&mut Pointer<String>>, index: usize) {
             debug_assert!(index > 0);
 
@@ -143,9 +152,9 @@ fn producer_consumer_ring() {
 
     let ring = {
         let mut ring = Vec::with_capacity(number_threads);
-        ring.resize_with(number_threads, || sync::Mutex::new(vec!()));
+        ring.resize_with(number_threads, || Mutex::new(vec!()));
 
-        sync::Arc::new(ring)
+        Arc::new(ring)
     };
 
     let pool = Pool::new(number_threads, |thread_index| {
@@ -235,7 +244,7 @@ fn producer_consumer_ring() {
 //  Multi-threaded helpers
 //
 
-struct Pool<T>(Vec<thread::JoinHandle<T>>);
+struct Pool<T>(Vec<JoinHandle<T>>);
 
 impl<T> Pool<T> {
     fn new<F, G>(count: usize, mut factory: F) -> Self
@@ -258,7 +267,7 @@ impl<T> Pool<T> {
         Self::join_handles(thread_handles)
     }
 
-    fn join_handles(thread_handles: Vec<thread::JoinHandle<T>>) -> Vec<T> {
+    fn join_handles(thread_handles: Vec<JoinHandle<T>>) -> Vec<T> {
         //  First join _all_ threads.
         let results: Vec<_> = thread_handles.into_iter()
             .map(|handle| handle.join())
@@ -305,24 +314,24 @@ impl<T> Drop for Pool<T> {
 //  }
 //  ```
 #[derive(Clone, Debug)]
-struct RendezVous(&'static str, sync::Arc<atomic::AtomicUsize>);
+struct RendezVous(&'static str, Arc<AtomicUsize>);
 
 impl RendezVous {
     fn new(name: &'static str, count: usize) -> Self {
-        Self(name, sync::Arc::new(atomic::AtomicUsize::new(count)))
+        Self(name, Arc::new(AtomicUsize::new(count)))
     }
 
     fn wait_until_all_ready(&self) {
-        self.1.fetch_sub(1, atomic::Ordering::AcqRel);
+        self.1.fetch_sub(1, Ordering::AcqRel);
 
         while !self.is_ready() {}
     }
 
-    fn is_ready(&self) -> bool { self.1.load(atomic::Ordering::Acquire) == 0 }
+    fn is_ready(&self) -> bool { self.1.load(Ordering::Acquire) == 0 }
 
     fn reset(&self, count: usize) {
         assert!(self.is_ready(), "{} not ready: {:?}", self.0, self.1);
-        self.1.store(count, atomic::Ordering::Release);
+        self.1.store(count, Ordering::Release);
     }
 }
 
@@ -335,7 +344,7 @@ fn number_iterations() -> usize { read_number_from_environment("LLMALLOC_MULTI_N
 fn number_threads() -> usize { read_number_from_environment("LLMALLOC_MULTI_NUMBER_THREADS", 4) }
 
 fn read_number_from_environment(name: &str, default: usize) -> usize {
-    for (n, value) in std::env::vars() {
+    for (n, value) in env::vars() {
         if n == name {
             if let Ok(result) = value.parse() {
                 println!("read_number_from_environment - {}: {}", name, result);
@@ -349,16 +358,16 @@ fn read_number_from_environment(name: &str, default: usize) -> usize {
 }
 
 struct Pointer<T> {
-    pointer: *mut T,
+    pointer: NonNull<T>,
 }
 
 impl<T> Pointer<T> {
     fn new(value: T) -> Self {
-        let size = std::mem::size_of::<T>();
-        let align = std::mem::align_of::<T>();
-        let pointer = LL_ALLOCATOR.allocate(layout(size, align)) as *mut T;
+        let size = mem::size_of::<T>();
+        let align = mem::align_of::<T>();
+        let pointer = LL_ALLOCATOR.allocate(layout(size, align)).unwrap().cast();
 
-        unsafe { std::ptr::write(pointer, value) }
+        unsafe { ptr::write(pointer.as_ptr(), value) }
 
         Pointer { pointer }
     }
@@ -381,20 +390,20 @@ impl<T> Default for Pointer<T>
 impl<T> Drop for Pointer<T> {
     fn drop(&mut self) {
         unsafe {
-            std::ptr::drop_in_place(self.pointer);
-            LL_ALLOCATOR.deallocate(self.pointer as *mut u8);
+            ptr::drop_in_place(self.pointer.as_ptr());
+            LL_ALLOCATOR.deallocate(self.pointer.cast());
         }
     }
 }
 
-impl<T> ops::Deref for Pointer<T> {
+impl<T> Deref for Pointer<T> {
     type Target = T;
 
-    fn deref(&self) -> &T { unsafe { &*self.pointer } }
+    fn deref(&self) -> &T { unsafe { &*self.pointer.as_ptr() } }
 }
 
-impl<T> ops::DerefMut for Pointer<T> {
-    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.pointer} }
+impl<T> DerefMut for Pointer<T> {
+    fn deref_mut(&mut self) -> &mut T { unsafe { &mut *self.pointer.as_ptr() } }
 }
 
 unsafe impl<T> Send for Pointer<T>
