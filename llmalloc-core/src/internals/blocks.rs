@@ -10,7 +10,6 @@
 //! Note: Blocks are never _constructed_, instead raw memory is reinterpreted as blocks.
 
 mod atomic_block_foreign_list;
-mod atomic_block_foreign_stack;
 mod atomic_block_foreign;
 mod block_foreign;
 mod block_foreign_list;
@@ -18,7 +17,6 @@ mod block_local;
 mod block_ptr;
 
 pub(crate) use atomic_block_foreign_list::AtomicBlockForeignList;
-pub(crate) use atomic_block_foreign_stack::AtomicBlockForeignStack;
 pub(crate) use atomic_block_foreign::AtomicBlockForeign;
 pub(crate) use block_foreign::BlockForeign;
 pub(crate) use block_foreign_list::BlockForeignList;

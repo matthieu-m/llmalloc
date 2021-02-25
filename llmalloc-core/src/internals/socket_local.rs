@@ -12,6 +12,7 @@
 //! The name comes from the socket in which a CPU is plugged in, as a recommendation to use one instance of SocketLocal
 //! for each socket.
 
+mod atomic_block_foreign_stack;
 mod huge_pages_manager;
 mod thread_locals_manager;
 
@@ -38,6 +39,7 @@ use crate::{
     utils,
 };
 
+use atomic_block_foreign_stack::AtomicBlockForeignStack;
 use huge_pages_manager::HugePagesManager;
 use thread_locals_manager::ThreadLocalsManager;
 
@@ -158,6 +160,9 @@ where
         //  -   `thread_local` is not null.
         thread_local.as_ref().flush(|page| Self::catch_large_page(page));
 
+        //  Safety:
+        //  -   `thread_local` points to valid memory.
+        //  -   `thread_local` is the exclusive point of access to that memory.
         self.thread_locals.release(thread_local)
     }
 

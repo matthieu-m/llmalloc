@@ -10,11 +10,13 @@ use core::{
 use crate::{Configuration, PowerOf2};
 use crate::{
     internals::{
-        blocks::{AtomicBlockForeign, AtomicBlockForeignStack},
-        thread_local::{ThreadLocal},
+        blocks::BlockForeign,
+        thread_local::ThreadLocal,
     },
     utils,
 };
+
+use super::AtomicBlockForeignStack;
 
 //  Manager of Thread Locals.
 pub(crate) struct ThreadLocalsManager<C> {
@@ -114,7 +116,12 @@ impl<C> ThreadLocalsManager<C>
     }
 
     //  Releases a ThreadLocal, after use.
-    pub(crate) fn release(&self, thread_local: NonNull<ThreadLocal<C>>) {
+    //
+    //  #   Safety
+    //
+    //  -   Assumes that `thread_local` points to a valid memory area.
+    //  -   Assumes that `thread_local` has exclusive access to this memory area.
+    pub(crate) unsafe fn release(&self, thread_local: NonNull<ThreadLocal<C>>) {
         debug_assert!(self.begin <= thread_local.cast());
         debug_assert!(thread_local.cast() < self.end);
 
@@ -134,11 +141,11 @@ impl<C> ThreadLocalsManager<C>
     }
 
     //  Internal; Pushes a ThreadLocal onto the stack.
-    fn push(&self, thread_local: NonNull<ThreadLocal<C>>) {
-        let cell = thread_local.cast();
-        unsafe { ptr::write(cell.as_ptr(), AtomicBlockForeign::default()) };
+    unsafe fn push(&self, thread_local: NonNull<ThreadLocal<C>>) {
+        let block = thread_local.cast();
+        ptr::write(block.as_ptr(), BlockForeign::default());
 
-        self.stack.push(cell);
+        self.stack.push(block);
     }
 }
 
@@ -239,7 +246,7 @@ fn thread_locals_acquire_release() {
 
     //  Release thread-locals.
     for ptr in &thread_locals {
-        manager.release(NonNull::new(*ptr).unwrap());
+        unsafe { manager.release(NonNull::new(*ptr).unwrap()) };
     }
 
     //  Acquire them again, in reverse order.

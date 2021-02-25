@@ -4,6 +4,7 @@ members = [
     "llmalloc-core",
     "llmalloc",
     "llmalloc-c",
+    "llmalloc-test",
 ]
 
 [profile.bench]

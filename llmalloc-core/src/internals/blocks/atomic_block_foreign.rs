@@ -78,3 +78,39 @@ impl AtomicBlockForeign {
         foreign_next_offset == atomic_next_offset && foreign_length_offset == atomic_length_offset
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+use super::*;
+
+#[test]
+fn atomic_block_foreign_from() {
+    let other = BlockForeign::default();
+    let other = NonNull::from(&other);
+
+    {
+        let block = BlockForeign::default();
+        let block = NonNull::from(&block);
+        let atomic = unsafe { AtomicBlockForeign::from(block) };
+        let atomic = unsafe { atomic.as_ref() };
+
+        assert_eq!(None, atomic.next.load());
+        assert_eq!(0, atomic.length.load());
+    }
+
+    {
+        let block = BlockForeign::default();
+        block.next.set(Some(other));
+        block.length.set(1);
+
+        let block = NonNull::from(&block);
+        let atomic = unsafe { AtomicBlockForeign::from(block) };
+        let atomic = unsafe { atomic.as_ref() };
+
+        assert_eq!(Some(other.cast::<u8>()), atomic.next.load().map(NonNull::cast::<u8>));
+        assert_eq!(1, atomic.length.load());
+    }
+}
+
+} // mod tests
