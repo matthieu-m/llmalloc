@@ -1,20 +1,17 @@
 //! An atomic bit mask representing the occupation (or not) of a block.
 
-use core::{
-    cmp,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::cmp;
 
 use crate::PowerOf2;
 
-use super::{NumberPages, PageIndex};
+use super::{AtomicBitMask, NumberPages, PageIndex};
 
 //  Page Tokens.
 //
 //  A bitmap of which Large Pages are available, and which are not, where 0 means available and 1 occupied.
 //
 //  The first bit is always 1, as the first Large Page is always occupied by the Huge Page header itself.
-pub(crate) struct PageTokens([BitMask; 8]);
+pub(crate) struct PageTokens([AtomicBitMask; 8]);
 
 impl PageTokens {
     /// Initialize the tokens based on the number of pages.
@@ -55,7 +52,7 @@ impl PageTokens {
     pub(crate) fn fast_allocate(&self) -> Option<PageIndex> {
         for (outer, bits) in self.0.iter().enumerate() {
             if let Some(inner) = bits.claim_single() {
-                return PageIndex::new(outer * BitMask::CAPACITY + inner);
+                return PageIndex::new(outer * AtomicBitMask::CAPACITY + inner);
             }
         }
 
@@ -72,10 +69,10 @@ impl PageTokens {
         const OUTER: &[&[usize]] = &[&[], OUTER_1, OUTER_2, &[], OUTER_4];
 
         //  Safety:
-        //  -   `align_pages / BitMask::CAPACITY` is either 0 or a power of 2.
+        //  -   `align_pages / AtomicBitMask::CAPACITY` is either 0 or a power of 2.
         //  -   1 is a power of 2.
         //  -   Hence the maximum is a power of 2.
-        let align_outer = align_pages / BitMask::CAPACITY;
+        let align_outer = align_pages / AtomicBitMask::CAPACITY;
         debug_assert!(align_outer == 0 || self.0.len() % align_outer == 0);
         debug_assert!(self.0.len() == 8, "{} != 8 => review `match`!", self.0.len());
 
@@ -98,7 +95,7 @@ impl PageTokens {
             _ => for outer in unsafe { *OUTER.get_unchecked(align_outer) } {
                 //  Safety:
                 //  -   `outer` is within bounds.
-                let index = unsafe { self.flexible_allocate_backward_from(*outer, number_pages, BitMask::CAPACITY) };
+                let index = unsafe { self.flexible_allocate_backward_from(*outer, number_pages, AtomicBitMask::CAPACITY) };
 
                 if let Ok(index) = index {
                     return Some(index);
@@ -115,7 +112,7 @@ impl PageTokens {
     ///
     /// -   Assumes that `index` is within bounds.
     pub(crate) unsafe fn fast_deallocate(&self, index: PageIndex) {
-        let (outer, inner) = (index.value() / BitMask::capacity(), index.value() % BitMask::capacity());
+        let (outer, inner) = (index.value() / AtomicBitMask::capacity(), index.value() % AtomicBitMask::capacity());
         debug_assert!(outer < self.0.len());
 
         self.0.get_unchecked(outer).release_single(inner);
@@ -128,7 +125,7 @@ impl PageTokens {
     /// -   Assumes that `index` is within bounds.
     /// -   Assumes that `index + number_pages` is within bounds.
     pub(crate) unsafe fn flexible_deallocate(&self, index: PageIndex, number_pages: NumberPages) {
-        let (outer, inner) = (index.value() / BitMask::capacity(), index.value() % BitMask::capacity());
+        let (outer, inner) = (index.value() / AtomicBitMask::capacity(), index.value() % AtomicBitMask::capacity());
         debug_assert!(outer < self.0.len());
 
         let (head_bits, middle_atomics, tail_bits) = Self::split(inner, number_pages.0);
@@ -138,7 +135,7 @@ impl PageTokens {
         self.0.get_unchecked(outer).release_multiple(inner, head_bits);
 
         for n in 0..middle_atomics {
-            self.0.get_unchecked(outer + n + 1).release_multiple(0, BitMask::capacity());
+            self.0.get_unchecked(outer + n + 1).release_multiple(0, AtomicBitMask::capacity());
         }
 
         if tail_bits != 0 {
@@ -147,7 +144,7 @@ impl PageTokens {
     }
 
     //  Internal: Returns the number of bits.
-    fn capacity(&self) -> usize { self.0.len() * BitMask::capacity() }
+    fn capacity(&self) -> usize { self.0.len() * AtomicBitMask::capacity() }
 
     //  Internal: Allocates number_pages, starting from outer.
     //
@@ -163,7 +160,7 @@ impl PageTokens {
         debug_assert!(number_pages.0 % align_pages == 0, "{} % {} != 0", number_pages.0, align_pages.value());
 
         //  The maximum capacity, accounting for the fact that `self.0` has 1 always reserved page.
-        let maximum_capacity = outer * BitMask::capacity() + BitMask::capacity() - 1;
+        let maximum_capacity = outer * AtomicBitMask::capacity() + AtomicBitMask::capacity() - 1;
 
         let number_pages = number_pages.0;
 
@@ -173,13 +170,13 @@ impl PageTokens {
         }
 
         let (inner, tail) =
-            match self.0.get_unchecked(outer).claim_multiple(cmp::min(number_pages, BitMask::capacity()), align_pages) {
+            match self.0.get_unchecked(outer).claim_multiple(cmp::min(number_pages, AtomicBitMask::capacity()), align_pages) {
                 Some(tuple) => tuple,
                 None => return Err(outer as isize - 1),
             };
 
         if tail == number_pages {
-            return PageIndex::new(outer * BitMask::capacity() + inner).ok_or(-1);
+            return PageIndex::new(outer * AtomicBitMask::capacity() + inner).ok_or(-1);
         }
 
         debug_assert!(inner == 0, "{} != 0", inner);
@@ -191,17 +188,17 @@ impl PageTokens {
             return Err(-1);
         }
 
-        let remaining_capacity = maximum_capacity - BitMask::capacity();
+        let remaining_capacity = maximum_capacity - AtomicBitMask::capacity();
         let remaining_pages = number_pages - tail;
         debug_assert!(remaining_pages % align_pages == 0, "{} % {} != 0", remaining_pages, align_pages.value());
 
-        //  There may have been capacity if the BitMask at `outer` could allocate more, but it failed to.
+        //  There may have been capacity if the AtomicBitMask at `outer` could allocate more, but it failed to.
         if remaining_pages > remaining_capacity {
             self.flexible_allocate_rewind(outer, outer, tail);
             return Err(-1);
         }
 
-        let (head, middle) = (remaining_pages % BitMask::capacity(), remaining_pages / BitMask::capacity());
+        let (head, middle) = (remaining_pages % AtomicBitMask::capacity(), remaining_pages / AtomicBitMask::capacity());
         debug_assert!(outer > middle);
         debug_assert!(head % align_pages == 0, "{} % {} != 0", head, align_pages.value());
 
@@ -209,39 +206,39 @@ impl PageTokens {
         debug_assert!(middle_outer > 0);
 
         for i in (middle_outer..outer).rev() {
-            if !self.0.get_unchecked(i).claim_at(0, BitMask::capacity()) {
-                //  The current BitMask `i` was released by claim_at, so only the other BitMasks need releasing.
+            if !self.0.get_unchecked(i).claim_at(0, AtomicBitMask::capacity()) {
+                //  The current AtomicBitMask `i` was released by claim_at, so only the other BitMasks need releasing.
                 self.flexible_allocate_rewind(i + 1, outer, tail);
                 return Err(i as isize - 1);
             }
         }
 
         if head == 0 {
-            return PageIndex::new(middle_outer * BitMask::capacity()).ok_or(-1);
+            return PageIndex::new(middle_outer * AtomicBitMask::capacity()).ok_or(-1);
         }
 
         let head_outer = middle_outer - 1;
 
-        if !self.0.get_unchecked(head_outer).claim_at(BitMask::capacity() - head, head) {
-            //  The current BitMask `middle_outer - 1` was released by claim_at, so only the other BitMasks need
+        if !self.0.get_unchecked(head_outer).claim_at(AtomicBitMask::capacity() - head, head) {
+            //  The current AtomicBitMask `middle_outer - 1` was released by claim_at, so only the other BitMasks need
             //  releasing.
             self.flexible_allocate_rewind(middle_outer, outer, tail);
             return Err(head_outer as isize);
         }
 
-        PageIndex::new(head_outer * BitMask::capacity() + BitMask::capacity() - head).ok_or(-1)
+        PageIndex::new(head_outer * AtomicBitMask::capacity() + AtomicBitMask::capacity() - head).ok_or(-1)
     }
 
     //  Internal: Releases the tentatively claimed pages.
     //
-    //  -   [from, to): Completely claimed BitMask.
+    //  -   [from, to): Completely claimed AtomicBitMask.
     //  -   to: first "tail" bits are claimed.
     unsafe fn flexible_allocate_rewind(&self, from: usize, to: usize, tail: usize) {
         debug_assert!(from <= to);
         debug_assert!(to < self.0.len());
 
         for i in from..to {
-            self.0.get_unchecked(i).release_multiple(0, BitMask::capacity());
+            self.0.get_unchecked(i).release_multiple(0, AtomicBitMask::capacity());
         }
 
         self.0.get_unchecked(to).release_multiple(0, tail);
@@ -249,14 +246,14 @@ impl PageTokens {
 
     //  Internal: Returns the number of head bits, middle atomics, tail bits.
     fn split(inner: usize, number_pages: usize) -> (usize, usize, usize) {
-        let head_bits = BitMask::capacity() - inner;
+        let head_bits = AtomicBitMask::capacity() - inner;
 
         if head_bits >= number_pages {
             return (number_pages, 0, 0);
         }
 
         let number_pages = number_pages - head_bits;
-        (head_bits, number_pages / BitMask::CAPACITY, number_pages % BitMask::CAPACITY)
+        (head_bits, number_pages / AtomicBitMask::CAPACITY, number_pages % AtomicBitMask::CAPACITY)
     }
 }
 
@@ -264,431 +261,27 @@ impl PageTokens {
 //  Implementation
 //
 
-struct BitMask(AtomicU64);
-
-impl BitMask {
-    //  Safety:
-    //  -   64 is a power of 2.
-    const CAPACITY: PowerOf2 = unsafe { PowerOf2::new_unchecked(64) };
-
-    /// Initializes the BitMask with the given mask.
-    fn initialize(&self, mask: u64) { self.0.store(mask, Ordering::Relaxed); }
-
-    /// Claims a 0 bit, returns its index or None if all bits are claimed.
-    fn claim_single(&self) -> Option<usize> {
-        loop {
-            //  Locate first 0 bit.
-            let current_mask = self.0.load(Ordering::Acquire);
-            let candidate = (!current_mask).trailing_zeros() as usize;
-
-            //  All bits are ones, move on.
-            if candidate == Self::capacity() { return None; }
-
-            let candidate_mask = 1u64 << candidate;
-            let before = self.0.fetch_or(candidate_mask, Ordering::AcqRel);
-
-            //  This thread claimed the bit first, victory!
-            if before & candidate_mask == 0 {
-                return Some(candidate);
-            }
-        }
-    }
-
-    /// Claims up to `number` bits, returns the index of the lowest claimed and the number of bits claimed, or None.
-    ///
-    /// This functions scans the bits from highest to lowest.
-    ///
-    /// If the number of returned bits is less than `number`, then the index is 0, allowing extending the allocation
-    /// to the correct number by claiming bits from the previous BitMask.
-    fn claim_multiple(&self, number: usize, align: PowerOf2) -> Option<(usize, usize)> {
-        //  Do a single pass over the bits, attempting to find `number` consecutive ones.
-        let mut progress_mask = 0;
-
-        loop {
-            //  Locate last 0 bit.
-            let current_mask = self.0.load(Ordering::Acquire) | progress_mask;
-
-            //  Potential number of available bits.
-            let potential = Self::capacity() - (!current_mask).leading_zeros() as usize;
-
-            //  Not enough potential bits available, try to claim as many low-bits as possible.
-            if potential < number { break; }
-
-            //  Highest lower index which allows `number` bits.
-            let candidate = align.round_down(potential - number);
-
-            let candidate_mask = Self::low(number) << candidate;
-
-            if self.claim(candidate_mask) {
-                return Some((candidate, number));
-            }
-
-            //  Force searches to discard previously checked bits.
-            //
-            //  Otherwise, it could enter an infinite loop attempting to claim n bits when only 1 is available.
-            progress_mask = Self::high(Self::capacity() - potential + 1);
-        }
-
-        //  Claim as many low-bits as possible, as long as they are aligned.
-        {
-            let current_mask = self.0.load(Ordering::Acquire);
-
-            let potential = align.round_down(current_mask.trailing_zeros() as usize);
-
-            if potential == 0 {
-                return None;
-            }
-
-            let candidate_mask = Self::low(potential);
-
-            if self.claim(candidate_mask) {
-                Some((0, potential))
-            } else {
-                None
-            }
-        }
-    }
-
-    /// Claims the exact number of bits at the exact index.
-    ///
-    /// Returns true on success, false on failure.
-    fn claim_at(&self, inner: usize, number: usize) -> bool {
-        let mask = Self::low(number) << inner;
-
-        self.claim(mask)
-    }
-
-    /// Releases bit at given index.
-    fn release_single(&self, inner: usize) {
-        debug_assert!(inner < Self::capacity());
-
-        let inner_mask = 1u64 << inner;
-
-        self.release(inner_mask);
-    }
-
-    /// Releases `number` bits starting at the given index.
-    fn release_multiple(&self, inner: usize, number: usize) {
-        debug_assert!(inner + number <= Self::capacity());
-
-        let mask = BitMask::low(number) << inner;
-
-        self.release(mask);
-    }
-
-    //  Internal: Returns the capacity as usize.
-    fn capacity() -> usize { Self::CAPACITY.value() }
-
-    //  Internal: Claims the bits, returns true on success, false on failure.
-    //
-    //  On failure, unclaims bits that were erroneously claimed.
-    fn claim(&self, mask: u64) -> bool {
-        let before = self.0.fetch_or(mask, Ordering::AcqRel);
-
-        //  Success!
-        if before & mask == 0 {
-            return true;
-        } 
-
-        //  Not all bits were claimed before, release the ones that were not.
-        //
-        //  Example:
-        //  -   mask:           0111.
-        //  -   before:         1010.
-        //  -   before & mask:  0010.
-        //  -   !before & mask: 0101.
-        if before & mask != mask {
-            self.release(!before & mask)
-        }
-
-        false
-    }
-
-    //  Internal: Releases the bits.
-    fn release(&self, mask: u64) {
-        let _before = self.0.fetch_and(!mask, Ordering::AcqRel);
-        debug_assert!(_before & mask == mask);
-    }
-
-    //  Internal: Computes a mask with the `number` high bits set, and all others unset.
-    fn high(number: usize) -> u64 {
-        debug_assert!(number <= Self::capacity());
-
-        !Self::low(Self::capacity() - number)
-    }
-
-    //  Internal: Computes a mask with the `number` low bits set, and all others unset.
-    fn low(number: usize) -> u64 {
-        debug_assert!(number <= Self::capacity());
-
-        if number == 64 {
-            u64::MAX
-        } else {
-            (1u64 << number) - 1
-        }
-    }
-}
-
-#[cfg(test)]
-impl Clone for BitMask {
-    fn clone(&self) -> Self {
-        let result = BitMask::default();
-        result.initialize(self.0.load(Ordering::Relaxed));
-        result
-    }
-}
-
-impl Default for BitMask {
-    fn default() -> Self { Self(AtomicU64::new(0)) }
-}
-
-
 #[cfg(test)]
 mod tests {
 
 use super::*;
+use super::super::atomic_bit_mask::load_bitmask;
 
-fn load_bitmask(bitmask: &BitMask) -> u64 { bitmask.0.load(Ordering::Relaxed) }
+//  Internal: Computes a mask with the `number` high bits set, and all others unset.
+fn high(number: usize) -> u64 {
+    debug_assert!(number <= AtomicBitMask::capacity());
 
-#[test]
-fn bitmask_initialize() {
-    fn initialize(mask: u64) -> u64 {
-        let bitmask = BitMask::default();
-        bitmask.initialize(mask);
-        load_bitmask(&bitmask)
-    }
-
-    assert_eq!(0, initialize(0));
-    assert_eq!(3, initialize(3));
-    assert_eq!(42, initialize(42));
-    assert_eq!(u64::MAX, initialize(u64::MAX));
+    !low(AtomicBitMask::capacity() - number)
 }
 
-#[test]
-fn bitmask_claim_single() {
-    //  Initializes bitmask with `mask`, call claim_single, return single + new state of bitmask
-    fn claim_single(mask: u64) -> (Option<usize>, u64) {
-        let bitmask = BitMask::default();
-        bitmask.initialize(mask);
+//  Internal: Computes a mask with the `number` low bits set, and all others unset.
+fn low(number: usize) -> u64 {
+    debug_assert!(number <= AtomicBitMask::capacity());
 
-        let claimed = bitmask.claim_single();
-
-        (claimed, load_bitmask(&bitmask))
-    }
-
-    assert_eq!((None, u64::MAX), claim_single(u64::MAX));
-
-    //  Check the next is claimed with a contigous pattern starting from beginning
-    for i in 0..63 {
-        let before = (1u64 << i) - 1;
-        let after = (1u64 << (i + 1)) - 1;
-
-        assert_eq!((Some(i), after), claim_single(before));
-    }
-
-    //  Check the one available bit is claimed if a single is available.
-    for i in 0..64 {
-        let mask = u64::MAX - (1u64 << i);
-
-        assert_eq!((Some(i), u64::MAX), claim_single(mask));
-    }
-}
-
-#[test]
-fn bitmask_claim_at() {
-    //  Initializes bitmask with `mask`, call claim_at with `index` and `number`, return result + new state of bitmask
-    fn claim_at(mask: u64, index: usize, number: usize) -> (bool, u64) {
-        let bitmask = BitMask::default();
-        bitmask.initialize(mask);
-
-        let result = bitmask.claim_at(index, number);
-
-        (result, load_bitmask(&bitmask))
-    }
-
-    for i in 0..64 {
-        assert_eq!((true, 1u64 << i), claim_at(0, i, 1));
-    }
-
-    for i in 0..64 {
-        assert_eq!((false, 1u64 << i), claim_at(1u64 << i, i, 1));
-    }
-
-    assert_eq!((true, u64::MAX), claim_at(0, 0, 64));
-    assert_eq!((false, 1), claim_at(1, 0, 64));
-}
-
-//  Initializes bitmask with `mask`, call claim_multiple with `number`, return result + new state of bitmask
-fn claim_multiple(mask: u64, number: usize) -> (Option<usize>, Option<usize>, u64) {
-    let bitmask = BitMask::default();
-    bitmask.initialize(mask);
-
-    if let Some(claimed) = bitmask.claim_multiple(number, PowerOf2::ONE) {
-        (Some(claimed.0), Some(claimed.1), load_bitmask(&bitmask))
+    if number == 64 {
+        u64::MAX
     } else {
-        (None, None, load_bitmask(&bitmask))
-    }
-}
-
-#[test]
-fn bitmask_claim_multiple_none() {
-    assert_eq!((None, None, u64::MAX), claim_multiple(u64::MAX, 1));
-
-    for i in 1..63 {
-        let mask = BitMask::low(i);
-        assert_eq!((None, None, mask), claim_multiple(mask, 65 - i));
-    }
-}
-
-#[test]
-fn bitmask_claim_multiple_complete() {
-    //  Claim multiple always starts from the _high_ bits.
-    for number in 1..=64 {
-        let after = BitMask::low(number) << (64 - number);
-        assert_eq!((Some(64 - number), Some(number), after), claim_multiple(0, number));
-    }
-}
-
-#[test]
-fn bitmask_claim_multiple_partial() {
-    //  Claim multiple should be able to claim N (< number) low bits.
-    for number in 1..=63 {
-        let before = BitMask::high(number);
-        assert_eq!((Some(0), Some(64 - number), u64::MAX), claim_multiple(before, 64));
-    }
-}
-
-#[test]
-fn bitmask_claim_multiple_pockmarked() {
-    let mask = {
-        BitMask::low(1) << 63 |
-        // 7 0-bits
-        BitMask::low(8) << 48 |
-        // 8 0-bits
-        BitMask::low(8) << 32 |
-        // 9 0-bits
-        BitMask::low(7) << 16 |
-        // 10 0-bits
-        BitMask::low(5) << 1
-        // 1 0-bits
-    };
-
-    let after = mask | BitMask::low(7) << 56;
-    assert_eq!((Some(56), Some(7), after), claim_multiple(mask, 7));
-
-    let after = mask | BitMask::low(8) << 40;
-    assert_eq!((Some(40), Some(8), after), claim_multiple(mask, 8));
-
-    let after = mask | BitMask::low(9) << 23;
-    assert_eq!((Some(23), Some(9), after), claim_multiple(mask, 9));
-
-    let after = mask | BitMask::low(10) << 6;
-    assert_eq!((Some(6), Some(10), after), claim_multiple(mask, 10));
-
-    let after = mask | BitMask::low(1);
-    assert_eq!((Some(0), Some(1), after), claim_multiple(mask, 11));
-}
-
-//  Initializes bitmask with `mask`, call claim_multiple with `number`, return result + new state of bitmask
-fn claim_multiple_aligned(mask: u64, number: usize, align: usize) -> (Option<usize>, Option<usize>, u64) {
-    let bitmask = BitMask::default();
-    bitmask.initialize(mask);
-
-    if let Some(claimed) = bitmask.claim_multiple(number, PowerOf2::new(align).expect("Power of 2")) {
-        (Some(claimed.0), Some(claimed.1), load_bitmask(&bitmask))
-    } else {
-        (None, None, load_bitmask(&bitmask))
-    }
-}
-
-#[test]
-fn bitmask_claim_multiple_aligned_none() {
-    let tests = [
-        ( 2, 0b10011001_10011001_10011001_10011001_10011001_10011001_10011001_10011001u64),
-        ( 4, 0b10000001_10000001_10000001_10000001_10000001_10000001_10000001_10000001u64),
-        ( 8, 0b10000000_00000001_10000000_00000001_10000000_00000001_10000000_00000001u64),
-        (16, 0b10000000_00000000_00000000_00000001_10000000_00000000_00000000_00000001u64),
-        (32, 0b10000000_00000000_00000000_00000000_00000000_00000000_00000000_00000001u64),
-        (64, BitMask::high(1)),
-    ];
-
-    for &(number, mask) in &tests {
-
-        assert_eq!((None, None, mask), claim_multiple_aligned(mask, number, number),
-            "mask: {:b}, number: {}", mask, number);
-    }
-}
-
-#[test]
-fn bitmask_claim_multiple_aligned_pockmarked() {
-    let mask = {
-        BitMask::low(1) << 63 |
-        //  2 0-bits
-        BitMask::low(1) << 60 |
-        BitMask::low(1) << 59 |
-        //  4 0-bits
-        BitMask::low(1) << 54 |
-        //  8 0-bits
-        BitMask::low(1) << 45 |
-        //  16 0-bits
-        BitMask::low(1) << 28
-        //  29 0-bits
-    };
-
-    let after = mask | BitMask::low(2) << 56;
-    assert_eq!((Some(56), Some(2), after), claim_multiple_aligned(mask, 2, 2));
-
-    let after = mask | BitMask::low(4) << 48;
-    assert_eq!((Some(48), Some(4), after), claim_multiple_aligned(mask, 4, 4));
-
-    let after = mask | BitMask::low(8) << 32;
-    assert_eq!((Some(32), Some(8), after), claim_multiple_aligned(mask, 8, 8));
-
-    let after = mask | BitMask::low(16);
-    assert_eq!((Some(0), Some(16), after), claim_multiple_aligned(mask, 16, 16));
-}
-
-#[test]
-fn bitmask_release_single() {
-    //  Initializes bitmask with `mask`, call release_single with `index`, return new state of bitmask
-    fn release_single(mask: u64, index: usize) -> u64 {
-        let bitmask = BitMask::default();
-        bitmask.initialize(mask);
-
-        bitmask.release_single(index);
-
-        load_bitmask(&bitmask)
-    }
-
-    for i in 0..64 {
-        assert_eq!(0, release_single(1u64 << i, i));
-    }
-
-    for i in 0..64 {
-        assert_eq!(u64::MAX - (1u64 << i), release_single(u64::MAX, i));
-    }
-}
-
-#[test]
-fn bitmask_release_multiple() {
-    //  Initializes bitmask with `mask`, call release_multiple with `index` and `number`, return new state of bitmask
-    fn release_multiple(mask: u64, index: usize, number: usize) -> u64 {
-        let bitmask = BitMask::default();
-        bitmask.initialize(mask);
-
-        bitmask.release_multiple(index, number);
-
-        load_bitmask(&bitmask)
-    }
-
-    assert_eq!(0, release_multiple(u64::MAX, 0, 64));
-
-    for i in 0..64 {
-        assert_eq!(0, release_multiple(1u64 << i, i, 1));
-    }
-
-    for i in 0..64 {
-        assert_eq!(u64::MAX - (1u64 << i), release_multiple(u64::MAX, i, 1));
+        (1u64 << number) - 1
     }
 }
 
@@ -740,22 +333,22 @@ fn page_tokens_new() {
 
     const FULL: u64 = u64::MAX;
 
-    check_tokens(new(511), [BitMask::low(1), 0, 0, 0, 0, 0, 0, 0]);
+    check_tokens(new(511), [low(1), 0, 0, 0, 0, 0, 0, 0]);
 
     for i in 1..=64 {
-        check_tokens(new(511 - i), [BitMask::low(1), 0, 0, 0, 0, 0, 0, BitMask::high(i)]);
+        check_tokens(new(511 - i), [low(1), 0, 0, 0, 0, 0, 0, high(i)]);
     }
 
     for i in 1..=64 {
-        check_tokens(new(511 - 64 - i), [BitMask::low(1), 0, 0, 0, 0, 0, BitMask::high(i), FULL]);
+        check_tokens(new(511 - 64 - i), [low(1), 0, 0, 0, 0, 0, high(i), FULL]);
     }
 
     for i in 1..=64 {
-        check_tokens(new(127 - i), [BitMask::low(1), BitMask::high(i), FULL, FULL, FULL, FULL, FULL, FULL]);
+        check_tokens(new(127 - i), [low(1), high(i), FULL, FULL, FULL, FULL, FULL, FULL]);
     }
 
     for i in 1..=62 {
-        check_tokens(new(63 - i), [BitMask::low(1) + BitMask::high(i), FULL, FULL, FULL, FULL, FULL, FULL, FULL]);
+        check_tokens(new(63 - i), [low(1) + high(i), FULL, FULL, FULL, FULL, FULL, FULL, FULL]);
     }
 }
 
@@ -773,11 +366,11 @@ fn page_tokens_fast_allocate() {
     assert_eq!(None, fast_allocate([full, full, full, full, full, full, full, full]));
 
     for i in 0..64 {
-        assert_eq!(Some(64 + i), fast_allocate([full, BitMask::low(i), full, full, full, full, full, full]));
+        assert_eq!(Some(64 + i), fast_allocate([full, low(i), full, full, full, full, full, full]));
     }
 
     for i in 0..64 {
-        assert_eq!(Some(64 * 7 + i), fast_allocate([full, full, full, full, full, full, full, BitMask::low(i)]));
+        assert_eq!(Some(64 * 7 + i), fast_allocate([full, full, full, full, full, full, full, low(i)]));
     }
 }
 
@@ -802,7 +395,7 @@ fn page_tokens_fast_deallocate() {
     );
 
     assert_eq!(
-        [1 + BitMask::high(62), 0, 0, 0, 0, 0, 0, 0],
+        [1 + high(62), 0, 0, 0, 0, 0, 0, 0],
         fast_deallocate(1, [full, 0, 0, 0, 0, 0, 0, 0])
     );
 }
@@ -822,16 +415,16 @@ fn page_tokens_flexible_allocate_success() {
     let all_empty = [1, 0, 0, 0, 0, 0, 0, 0];
     let all_full = [full, full, full, full, full, full, full, full];
 
-    assert_eq!(Some(510), flexible_allocate(2, all_empty, [1, 0, 0, 0, 0, 0, 0, BitMask::high(2)]));
+    assert_eq!(Some(510), flexible_allocate(2, all_empty, [1, 0, 0, 0, 0, 0, 0, high(2)]));
     assert_eq!(Some(1), flexible_allocate(511, all_empty, all_full));
 
     for number in 2..=64 {
-        let expected = [1, 0, 0, 0, 0, 0, 0, BitMask::high(number)];
+        let expected = [1, 0, 0, 0, 0, 0, 0, high(number)];
         assert_eq!(Some(512 - number), flexible_allocate(number, all_empty, expected));
     }
 
     for number in 1..=64 {
-        let expected = [1, 0, 0, 0, 0, 0, BitMask::high(number), full];
+        let expected = [1, 0, 0, 0, 0, 0, high(number), full];
         assert_eq!(Some(512 - 64 - number), flexible_allocate(64 + number, all_empty, expected));
     }
 }
@@ -845,13 +438,13 @@ fn page_tokens_flexible_allocate_failure() {
     assert_eq!(None, flexible_allocate(511, all_full, all_full));
 
     for number in 2..=64 {
-        let mask = BitMask::low(65 - number);
+        let mask = low(65 - number);
         let tokens = [mask, mask, mask, mask, mask, mask, mask, mask];
         assert_eq!(None, flexible_allocate(number, tokens, tokens));
     }
 
     for number in 1..=64 {
-        let mask = BitMask::low(65 - number);
+        let mask = low(65 - number);
         let tokens = [mask, 0, mask, 0, mask, 0, mask, 0];
         assert_eq!(None, flexible_allocate(64 + number, tokens, tokens));
     }
@@ -862,14 +455,14 @@ fn page_tokens_flexible_allocate_straddling() {
     let full = u64::MAX;
 
     for number in 2..=64 {
-        let initial = [1, 0, 0, 0, 0, 0, 0, BitMask::high(63)];
-        let expected = [1, 0, 0, 0, 0, 0, BitMask::high(number - 1), full];
+        let initial = [1, 0, 0, 0, 0, 0, 0, high(63)];
+        let expected = [1, 0, 0, 0, 0, 0, high(number - 1), full];
         assert_eq!(Some(512 - 63 - number), flexible_allocate(number, initial, expected));
     }
 
     for number in 1..=64 {
-        let initial = [1, 0, 0, 0, 0, 0, 0, BitMask::high(63)];
-        let expected = [1, 0, 0, 0, 0, BitMask::high(number - 1), full, full];
+        let initial = [1, 0, 0, 0, 0, 0, 0, high(63)];
+        let expected = [1, 0, 0, 0, 0, high(number - 1), full, full];
         assert_eq!(Some(512 - 63 - 64 - number), flexible_allocate(64 + number, initial, expected));
     }
 }
@@ -891,27 +484,27 @@ fn page_tokens_flexible_allocate_aligned_small_success() {
     let full = u64::MAX;
     let all_empty = [1, 0, 0, 0, 0, 0, 0, 0];
 
-    assert_eq!(Some(510), flexible_allocate_aligned(2, 2, all_empty, [1, 0, 0, 0, 0, 0, 0, BitMask::high(2)]));
+    assert_eq!(Some(510), flexible_allocate_aligned(2, 2, all_empty, [1, 0, 0, 0, 0, 0, 0, high(2)]));
     assert_eq!(Some(512 - 64), flexible_allocate_aligned(64, 64, all_empty, [1, 0, 0, 0, 0, 0, 0, full]));
 
-    let before = [1, 0, 0, 0, 0, 0, 0, BitMask::high(1)];
+    let before = [1, 0, 0, 0, 0, 0, 0, high(1)];
     let tests = [
-        ( 2, [1, 0, 0, 0, 0, 0, 0, BitMask::high(1) + (BitMask::low(2) << 60)]),
-        ( 4, [1, 0, 0, 0, 0, 0, 0, BitMask::high(1) + (BitMask::low(4) << 56)]),
-        ( 8, [1, 0, 0, 0, 0, 0, 0, BitMask::high(1) + (BitMask::low(8) << 48)]),
-        (16, [1, 0, 0, 0, 0, 0, 0, BitMask::high(1) + (BitMask::low(16) << 32)]),
-        (32, [1, 0, 0, 0, 0, 0, 0, BitMask::high(1) + BitMask::low(32)]),
-        (64, [1, 0, 0, 0, 0, 0, full, BitMask::high(1)]),
+        ( 2, [1, 0, 0, 0, 0, 0, 0, high(1) + (low(2) << 60)]),
+        ( 4, [1, 0, 0, 0, 0, 0, 0, high(1) + (low(4) << 56)]),
+        ( 8, [1, 0, 0, 0, 0, 0, 0, high(1) + (low(8) << 48)]),
+        (16, [1, 0, 0, 0, 0, 0, 0, high(1) + (low(16) << 32)]),
+        (32, [1, 0, 0, 0, 0, 0, 0, high(1) + low(32)]),
+        (64, [1, 0, 0, 0, 0, 0, full, high(1)]),
     ];
 
     for &(number, expected) in &tests {
         assert_eq!(Some(512 - number * 2), flexible_allocate_aligned(number, number, before, expected));
     }
 
-    let before = [1, 0, 0, 0, 0, 0, BitMask::high(1), full];
+    let before = [1, 0, 0, 0, 0, 0, high(1), full];
     for number in 1..=31 {
         let number = number * 2;
-        let expected = [1, 0, 0, 0, 0, 0, BitMask::high(number + 2) - (BitMask::high(1) >> 1), full];
+        let expected = [1, 0, 0, 0, 0, 0, high(number + 2) - (high(1) >> 1), full];
         assert_eq!(Some(512 - 64 - number - 2), flexible_allocate_aligned(number, 2, before, expected));
     }
 }
@@ -928,8 +521,8 @@ fn page_tokens_flexible_allocate_aligned_small_failure() {
 #[test]
 fn page_tokens_flexible_allocate_aligned_128() {
     let full = u64::MAX;
-    let one = BitMask::low(1) << 11;
-    let two = BitMask::low(1) << 33;
+    let one = low(1) << 11;
+    let two = low(1) << 33;
     let all_empty = [1, 0, 0, 0, 0, 0, 0, 0];
 
     assert_eq!(Some(384), flexible_allocate_aligned(128, 128, all_empty, [1, 0, 0, 0, 0, 0, full, full]));
@@ -955,8 +548,8 @@ fn page_tokens_flexible_allocate_aligned_256() {
             let mut before = all_empty;
             let mut after = [1, 0, 0, 0, full, full, full, full];
 
-            before[outer] |= BitMask::low(1) << inner;
-            after[outer] |= BitMask::low(1) << inner;
+            before[outer] |= low(1) << inner;
+            after[outer] |= low(1) << inner;
 
             assert_eq!(Some(256), flexible_allocate_aligned(256, 256, before, after));
         }
@@ -965,7 +558,7 @@ fn page_tokens_flexible_allocate_aligned_256() {
     for outer in 4..=7 {
         for inner in 0..=63 {
             let mut mask = all_empty;
-            mask[outer] |= BitMask::low(1) << inner;
+            mask[outer] |= low(1) << inner;
 
             assert_eq!(None, flexible_allocate_aligned(256, 256, mask, mask));
         }
@@ -985,7 +578,7 @@ fn page_tokens_flexible_deallocate() {
 
     assert_eq!(
         [1, 0, 0, 0, 0, 0, 0, 0],
-        flexible_deallocate(510, 2, [1, 0, 0, 0, 0, 0, 0, BitMask::high(2)])
+        flexible_deallocate(510, 2, [1, 0, 0, 0, 0, 0, 0, high(2)])
     );
 
     assert_eq!(
@@ -994,17 +587,17 @@ fn page_tokens_flexible_deallocate() {
     );
 
     assert_eq!(
-        [1, 0, 0, 0, BitMask::low(3) + BitMask::high(40), 0, 0, 0],
+        [1, 0, 0, 0, low(3) + high(40), 0, 0, 0],
         flexible_deallocate(64 * 4 + 3, 21, [1, 0, 0, 0, full, 0, 0, 0])
     );
 
     assert_eq!(
-        [1, 0, 0, BitMask::low(37), BitMask::high(40), 0, 0, 0],
+        [1, 0, 0, low(37), high(40), 0, 0, 0],
         flexible_deallocate(64 * 3 + 37, 51, [1, 0, 0, full, full, 0, 0, 0])
     );
 
     assert_eq!(
-        [1, 0, BitMask::low(37), 0, 0, BitMask::high(40), 0, 0],
+        [1, 0, low(37), 0, 0, high(40), 0, 0],
         flexible_deallocate(64 * 2 + 37, 179, [1, 0, full, full, full, full, 0, 0])
     );
 }

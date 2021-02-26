@@ -5,6 +5,7 @@
 //!
 //! A `SocketLocal` may own multiple 
 
+mod atomic_bit_mask;
 mod foreign;
 mod number_pages;
 mod page_index;
@@ -23,6 +24,7 @@ use core::{
 use crate::{Configuration, PowerOf2};
 use crate::utils;
 
+use atomic_bit_mask::AtomicBitMask;
 use foreign::Foreign;
 use number_pages::NumberPages;
 use page_index::PageIndex;
