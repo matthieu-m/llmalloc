@@ -57,6 +57,7 @@ impl BlockForeignList {
                 //  Safety:
                 //  -   Bounded lifetime.
                 unsafe {
+                    block.as_ref().next.set(None);
                     block.as_ref().length.set(0);
                     block.as_ref().tail.set(Some(block));
                 }
