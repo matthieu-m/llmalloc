@@ -264,6 +264,10 @@ impl PageTokens {
 #[cfg(test)]
 mod tests {
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use llmalloc_test::BurstyBuilder;
+
 use super::*;
 use super::super::atomic_bit_mask::load_bitmask;
 
@@ -600,6 +604,263 @@ fn page_tokens_flexible_deallocate() {
         [1, 0, low(37), 0, 0, high(40), 0, 0],
         flexible_deallocate(64 * 2 + 37, 179, [1, 0, full, full, full, full, 0, 0])
     );
+}
+
+struct Global {
+    victim: PageTokens,
+    page_indexes: [AtomicUsize; 4],
+}
+
+impl Global {
+    fn new(number_pages: usize) -> Self {
+        let victim = PageTokens::new(NumberPages(number_pages));
+        let page_indexes = Default::default();
+
+        Self { victim, page_indexes }
+    }
+
+    fn reset(&self, expected_free_pages: usize) {
+        let actual_free_pages = load_page_tokens(&self.victim).iter()
+            .map(|page| page.count_zeros() as usize)
+            .sum();
+        assert_eq!(expected_free_pages, actual_free_pages);
+
+        for page_index in &self.page_indexes {
+            page_index.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn set(&self, thread: usize, page_index: PageIndex) {
+        self.page_indexes[thread].store(page_index.value(), Ordering::Relaxed);
+    }
+
+    fn page_indexes(&self) -> Vec<usize> {
+        let mut page_indexes: Vec<_> = self.page_indexes.iter()
+            .map(|page_index| page_index.load(Ordering::Relaxed))
+            .filter(|page_index| *page_index != 0)
+            .collect();
+        page_indexes.sort();
+        page_indexes
+    }
+
+    #[track_caller]
+    fn verify_alignment(&self, alignment: PowerOf2) {
+        let indexes = self.page_indexes();
+        for index in &indexes {
+            assert_eq!(0, *index % alignment, "{:?}", indexes);
+        }
+    }
+
+    #[track_caller]
+    fn verify_non_overlapping(&self, number_pages: NumberPages) {
+        let indexes = self.page_indexes();
+
+        for pair in indexes.windows(2) {
+            assert!(pair[1] - pair[0] >= number_pages.0, "{:?}", indexes);
+        }
+    }
+}
+
+struct Local {
+    index: usize,
+    allocated: Option<PageIndex>,
+}
+
+impl Local {
+    fn new(index: usize) -> Self { Self { index, allocated: None, } }
+}
+
+#[test]
+fn page_tokens_concurrent_fast_allocate_deallocate_success_fuzzing() {
+    //  This test aims at validating that fast_allocate can be called concurrently.
+    //
+    //  The test is primed with an empty PageTokens of sufficient capacity.
+    //  -   The global state is reset.
+    //  -   Each thread calls fast_allocate, stores the result locally _and_ globally.
+    //  -   Each thread calls fast_deallocate.
+    //  -   The globally stored indices are checked.
+    let mut builder = BurstyBuilder::new(Global::new(4),
+        vec!(Local::new(0), Local::new(1), Local::new(2), Local::new(3)));
+
+    //  Step 1: reset.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        global.reset(4);
+        local.allocated = None;
+    });
+
+    //  Step 2: allocate.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        let allocated = global.victim.fast_allocate();
+
+        if let Some(allocated) = allocated {
+            local.allocated = Some(allocated);
+            global.set(local.index, allocated);
+        }
+    });
+
+    //  Step 3: deallocate.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        if let Some(allocated) = local.allocated {
+            unsafe { global.victim.fast_deallocate(allocated) };
+        }
+    });
+
+    //  Step 4: check allocations.
+    builder.add_simple_step(|| |global: &Global, _: &mut Local| {
+        assert_eq!(vec!(1, 2, 3, 4), global.page_indexes());
+    });
+
+    builder.launch(100);
+}
+
+#[test]
+fn page_tokens_concurrent_fast_allocate_deallocate_failure_fuzzing() {
+    //  This test aims at validating that fast_allocate can be called concurrently.
+    //
+    //  The test is primed with an empty PageTokens of sufficient capacity.
+    //  -   The global state is reset.
+    //  -   Each thread calls fast_allocate, stores the result locally _and_ globally.
+    //  -   Each thread calls fast_deallocate.
+    //  -   The globally stored indices are checked.
+    let mut builder = BurstyBuilder::new(Global::new(3),
+        vec!(Local::new(0), Local::new(1), Local::new(2), Local::new(3)));
+
+    //  Step 1: reset.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        global.reset(3);
+        local.allocated = None;
+    });
+
+    //  Step 2: allocate.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        let allocated = global.victim.fast_allocate();
+
+        if let Some(allocated) = allocated {
+            local.allocated = Some(allocated);
+            global.set(local.index, allocated);
+        }
+    });
+
+    //  Step 3: deallocate.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        if let Some(allocated) = local.allocated {
+            unsafe { global.victim.fast_deallocate(allocated) };
+        }
+    });
+
+    //  Step 4: check allocations.
+    builder.add_simple_step(|| |global: &Global, _: &mut Local| {
+        assert_eq!(vec!(1, 2, 3), global.page_indexes());
+    });
+
+    builder.launch(100);
+}
+
+#[test]
+fn page_tokens_concurrent_flexible_allocate_deallocate_success_fuzzing() {
+    //  This test aims at validating that flexible_allocate can be called concurrently.
+    //
+    //  The test is primed with an empty PageTokens of sufficient capacity.
+    //  -   The global state is reset.
+    //  -   Each thread calls flexible_allocate, stores the result locally _and_ globally.
+    //  -   Each thread calls flexible_deallocate.
+    //  -   The globally stored indices are checked.
+    const NUMBER_PAGES: NumberPages = NumberPages(22);
+    const ALIGNMENT: PowerOf2 = unsafe { PowerOf2::new_unchecked(2) };
+
+    //  Due to collisions & partial commits, part of the available pages will be attempted, skipped, and yet released
+    //  during rollback, leaving them free in the end. Hence, some overhead is needed.
+    const INITIAL_PAGES: usize = NUMBER_PAGES.0 * 5 + 1;
+
+    let mut builder = BurstyBuilder::new(Global::new(INITIAL_PAGES),
+        vec!(Local::new(0), Local::new(1), Local::new(2), Local::new(3)));
+
+    //  Step 1: reset.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        global.reset(INITIAL_PAGES);
+        local.allocated = None;
+    });
+
+    //  Step 2: allocate.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        let allocated = global.victim.flexible_allocate(NUMBER_PAGES, ALIGNMENT);
+
+        if let Some(allocated) = allocated {
+            local.allocated = Some(allocated);
+            global.set(local.index, allocated);
+        }
+    });
+
+    //  Step 3: deallocate.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        if let Some(allocated) = local.allocated {
+            unsafe { global.victim.flexible_deallocate(allocated, NUMBER_PAGES) };
+        }
+    });
+
+    //  Step 4: check allocations.
+    builder.add_simple_step(|| |global: &Global, _: &mut Local| {
+        let indexes = global.page_indexes();
+        assert_eq!(4, indexes.len(), "{:?}", indexes);
+
+        global.verify_alignment(ALIGNMENT);
+        global.verify_non_overlapping(NUMBER_PAGES);
+    });
+
+    builder.launch(100);
+}
+
+#[test]
+fn page_tokens_concurrent_flexible_allocate_deallocate_failure_fuzzing() {
+    //  This test aims at validating that flexible_allocate can be called concurrently.
+    //
+    //  The test is primed with an empty PageTokens of sufficient capacity.
+    //  -   The global state is reset.
+    //  -   Each thread calls flexible_allocate, stores the result locally _and_ globally.
+    //  -   Each thread calls flexible_deallocate.
+    //  -   The globally stored indices are checked.
+    const NUMBER_PAGES: NumberPages = NumberPages(22);
+    const ALIGNMENT: PowerOf2 = unsafe { PowerOf2::new_unchecked(2) };
+
+    //  It's expected that only 2 are likely to succeed, but maybe 3 will...
+    const INITIAL_PAGES: usize = NUMBER_PAGES.0 * 3 + 1;
+
+    let mut builder = BurstyBuilder::new(Global::new(INITIAL_PAGES),
+        vec!(Local::new(0), Local::new(1), Local::new(2), Local::new(3)));
+
+    //  Step 1: reset.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        global.reset(INITIAL_PAGES);
+        local.allocated = None;
+    });
+
+    //  Step 2: allocate.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        let allocated = global.victim.flexible_allocate(NUMBER_PAGES, ALIGNMENT);
+
+        if let Some(allocated) = allocated {
+            local.allocated = Some(allocated);
+            global.set(local.index, allocated);
+        }
+    });
+
+    //  Step 3: deallocate.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        if let Some(allocated) = local.allocated {
+            unsafe { global.victim.flexible_deallocate(allocated, NUMBER_PAGES) };
+        }
+    });
+
+    //  Step 4: check allocations.
+    builder.add_simple_step(|| |global: &Global, _: &mut Local| {
+        let indexes = global.page_indexes();
+        assert!(indexes.len() >= 2, "{:?}", indexes);
+
+        global.verify_alignment(ALIGNMENT);
+        global.verify_non_overlapping(NUMBER_PAGES);
+    });
+
+    builder.launch(100);
 }
 
 } // mod tests
