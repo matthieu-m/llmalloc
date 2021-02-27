@@ -63,6 +63,10 @@ impl Default for Adrift {
 #[cfg(test)]
 mod tests {
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use llmalloc_test::BurstyBuilder;
+
 use super::*;
 
 #[test]
@@ -81,6 +85,69 @@ fn adrift() {
 
     assert_eq!(3, adrift.cast_adrift());
     assert_eq!(Some(3), adrift.is_adrift());
+}
+
+#[test]
+fn adrift_concurrent_catch_fuzzing() {
+    //  This test aims at testing that a single thread can catch an adrift page.
+    //
+    //  To do so:
+    //  -   Adrift is cast adrift.
+    //  -   Each thread attempts to catch it, recording whether it did.
+    //  -   A check is made that a single thread caught it.
+    #[derive(Default)]
+    struct Global {
+        victim: Adrift,
+        cast: AtomicU64,
+        caught: [AtomicU64; 4],
+    }
+
+    impl Global {
+        fn reset(&self, index: usize) {
+            if index == 0 {
+                if let Some(current) = self.victim.is_adrift() {
+                    assert!(self.victim.catch(current));
+                }
+                self.cast.store(self.victim.cast_adrift(), Ordering::Relaxed);
+            }
+
+            self.caught[index].store(0, Ordering::Relaxed);
+        }
+
+        fn verify(&self) {
+            let cast = self.cast.load(Ordering::Relaxed);
+
+            let caught: Vec<_> = self.caught.iter()
+                .map(|caught| caught.load(Ordering::Relaxed))
+                .filter(|caught| *caught != 0)
+                .collect();
+
+            assert_eq!(vec!(cast), caught, "{:?}", self.caught);
+        }
+    }
+
+    let mut builder = BurstyBuilder::new(Global::default(), vec!(0usize, 1, 2, 3));
+
+    //  Step 1: reset.
+    builder.add_simple_step(|| |global: &Global, local: &mut usize| {
+        global.reset(*local);
+    });
+
+    //  Step 2: catch, if you can!
+    builder.add_simple_step(|| |global: &Global, local: &mut usize| {
+        let cast = global.cast.load(Ordering::Relaxed);
+
+        if global.victim.catch(cast) {
+            global.caught[*local].store(cast, Ordering::Relaxed);
+        }
+    });
+
+    //  Step 3: verify one, and only one, thread caught it.
+    builder.add_simple_step(|| |global: &Global, _: &mut usize| {
+        global.verify();
+    });
+
+    builder.launch(100);
 }
 
 } // mod tests
