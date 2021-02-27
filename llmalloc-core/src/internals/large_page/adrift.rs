@@ -52,6 +52,10 @@ impl Adrift {
         self.0.compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     }
 
+    //  Introspection for testing purposes.
+    #[cfg(test)]
+    pub(crate) fn value(&self) -> u64 { self.0.load(Ordering::Relaxed) }
+
     //  Internal: load.
     fn load(&self) -> u64 { self.0.load(Ordering::Acquire) }
 }

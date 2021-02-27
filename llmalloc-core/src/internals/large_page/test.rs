@@ -25,7 +25,7 @@ impl BlockStore {
     }
 
     /// Borrows self, outside of the compiler's overview.
-    pub(crate) unsafe fn create_local(&mut self, block_size: usize) -> Local {
+    pub(crate) unsafe fn create_local(&self, block_size: usize) -> Local {
         assert!(block_size >= mem::size_of::<BlockForeign>());
 
         let (begin, end) = self.begin_end(block_size);

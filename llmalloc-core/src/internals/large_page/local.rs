@@ -133,7 +133,7 @@ use super::super::test::{BlockStore, BLOCK_SIZE};
 fn local_new() {
     //  This test actually tests `block_store.create_local` more than anything.
     //  Since further tests will depend on it correctly initializing `Local`, it is better to validate it early.
-    let mut block_store = BlockStore::default();
+    let block_store = BlockStore::default();
     let end_store = block_store.end();
 
     {
@@ -153,7 +153,7 @@ fn local_new() {
 
 #[test]
 fn local_allocate_expansion() {
-    let mut block_store = BlockStore::default();
+    let block_store = BlockStore::default();
     let local = unsafe { block_store.create_local(BLOCK_SIZE) };
 
     //  Bump watermark until it is no longer possible.
@@ -168,7 +168,7 @@ fn local_allocate_expansion() {
 
 #[test]
 fn local_allocate_deallocate_ping_pong() {
-    let mut block_store = BlockStore::default();
+    let block_store = BlockStore::default();
     let local = unsafe { block_store.create_local(BLOCK_SIZE) };
 
     let ptr = local.allocate();
@@ -183,7 +183,7 @@ fn local_allocate_deallocate_ping_pong() {
 
 #[test]
 fn local_extend() {
-    let mut block_store = BlockStore::default();
+    let block_store = BlockStore::default();
     let local = unsafe { block_store.create_local(BLOCK_SIZE) };
 
     //  Allocate all.
@@ -201,7 +201,7 @@ fn local_extend() {
 
 #[test]
 fn local_refill() {
-    let mut block_store = BlockStore::default();
+    let block_store = BlockStore::default();
     let local = unsafe { block_store.create_local(BLOCK_SIZE) };
 
     //  Allocate all.
