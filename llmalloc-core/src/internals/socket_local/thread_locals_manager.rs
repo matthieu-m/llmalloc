@@ -2,7 +2,7 @@
 
 use core::{
     marker::PhantomData,
-    mem,
+    mem::{self, ManuallyDrop},
     ptr::{self, NonNull},
     sync::atomic::{self, Ordering},
 };
@@ -10,20 +10,25 @@ use core::{
 use crate::{Configuration, PowerOf2};
 use crate::{
     internals::{
-        blocks::BlockForeign,
+        atomic_stack::{AtomicStack, AtomicStackElement, AtomicStackLink},
         thread_local::ThreadLocal,
     },
     utils,
 };
-
-use super::AtomicBlockForeignStack;
 
 //  Manager of Thread Locals.
 pub(crate) struct ThreadLocalsManager<C> {
     //  Owner.
     owner: *mut (),
     //  Stack of available thread-locals.
-    stack: AtomicBlockForeignStack,
+    //
+    //  AtomicStack is not entirely ABA-proof in case of concurrent pop vs pop+re-push. Here, it should work fine as
+    //  the delay between pop and re-push is large, considering that it involves creating _and_ destroying an OS thread.
+    //
+    //  In a low-latency scenario, with uninterrupted threads, the chances of _that_ happening within the time another
+    //  thread takes to just execute pop are exceedingly low, and thus _hopefully_ the merkle-chain of AtomicStack will
+    //  be sufficient to guard against those rare cases.
+    stack: AtomicStack<MaybeThreadLocal<C>>,
     //  Current watermark for fresh allocations into the buffer area.
     watermark: atomic::AtomicPtr<u8>,
     //  Begin of buffer area.
@@ -61,7 +66,7 @@ impl<C> ThreadLocalsManager<C>
         //  -   `start` is not null, since `watermark` is not null.
         let begin = unsafe { NonNull::new_unchecked(start) };
 
-        let stack = AtomicBlockForeignStack::default();
+        let stack = AtomicStack::default();
 
         Self { owner, stack, watermark, begin, end, _configuration, }
     }
@@ -112,7 +117,7 @@ impl<C> ThreadLocalsManager<C>
         //  -   `current` is non null.
         let guarded = unsafe { &*current };
 
-        Some(NonNull::from(&guarded.thread_local))
+        Some(NonNull::from(unsafe { &*guarded.maybe_thread_local.thread_local }))
     }
 
     //  Releases a ThreadLocal, after use.
@@ -130,22 +135,18 @@ impl<C> ThreadLocalsManager<C>
 
     //  Internal; Pops a ThreadLocal off the stack, if any.
     fn pop(&self) -> Option<NonNull<ThreadLocal<C>>> {
-        self.stack.pop().map(|cell| {
-            let thread_local = cell.cast();
+        self.stack.pop().map(|maybe| {
             //  Safety:
-            //  -   `thread_local` is valid for writes.
-            //  -   `thread_local` is properly aligned.
-            unsafe { ptr::write(thread_local.as_ptr(), ThreadLocal::new(self.owner)) };
-            thread_local
+            //  -   Access to `maybe` is exclusive.
+            unsafe { MaybeThreadLocal::into_thread_local(maybe, self.owner) }
         })
     }
 
     //  Internal; Pushes a ThreadLocal onto the stack.
     unsafe fn push(&self, thread_local: NonNull<ThreadLocal<C>>) {
-        let block = thread_local.cast();
-        ptr::write(block.as_ptr(), BlockForeign::default());
+        let maybe = MaybeThreadLocal::from_thread_local(thread_local);
 
-        self.stack.push(block);
+        self.stack.push(&mut *maybe.as_ptr());
     }
 }
 
@@ -157,7 +158,7 @@ impl<C> ThreadLocalsManager<C>
 #[repr(C)]
 struct GuardedThreadLocal<C>{
     _guard: utils::PrefetchGuard,
-    thread_local: ThreadLocal<C>,
+    maybe_thread_local: MaybeThreadLocal<C>,
 }
 
 impl<C> GuardedThreadLocal<C>
@@ -165,7 +166,7 @@ impl<C> GuardedThreadLocal<C>
         C: Configuration
 {
     fn new(owner: *mut ()) -> Self {
-        GuardedThreadLocal { _guard: Default::default(), thread_local: ThreadLocal::new(owner) }
+        GuardedThreadLocal { _guard: Default::default(), maybe_thread_local: MaybeThreadLocal::new(owner) }
     }
 }
 
@@ -174,6 +175,48 @@ impl<C> Default for GuardedThreadLocal<C>
         C: Configuration
 {
     fn default() -> Self { Self::new(ptr::null_mut()) }
+}
+
+#[repr(align(128))]
+union MaybeThreadLocal<C> {
+    next: ManuallyDrop<AtomicStackLink<Self>>,
+    thread_local: ManuallyDrop<ThreadLocal<C>>,
+}
+
+impl<C: Configuration> MaybeThreadLocal<C> {
+    fn new(owner: *mut ()) -> Self {
+        Self { thread_local: ManuallyDrop::new(ThreadLocal::new(owner)) }
+    }
+
+    //  Returns `pointer` memory with freshly initialized `AtomicStackLink` instance inside.
+    //
+    //  #   Safety:
+    //
+    //  -   Assumes exclusive access to the memory pointed to by `this`.
+    unsafe fn from_thread_local(pointer: NonNull<ThreadLocal<C>>) -> NonNull<Self> {
+        let mut this: NonNull<Self> = pointer.cast();
+
+        this.as_mut().next = ManuallyDrop::new(AtomicStackLink::default());
+
+        this
+    }
+
+    //  Returns `this` memory with freshly initialized `ThreadLocal` instance inside.
+    //
+    //  #   Safety:
+    //
+    //  -   Assumes exclusive access to the memory pointed to by `this`.
+    unsafe fn into_thread_local(mut this: NonNull<Self>, owner: *mut ()) -> NonNull<ThreadLocal<C>> {
+        let this = this.as_mut();
+
+        this.thread_local = ManuallyDrop::new(ThreadLocal::new(owner));
+
+        NonNull::from(&mut *this.thread_local)
+    }
+}
+
+impl<C> AtomicStackElement for MaybeThreadLocal<C> {
+    fn next(&self) -> &AtomicStackLink<Self> { unsafe { &self.next } }
 }
 
 #[cfg(test)]

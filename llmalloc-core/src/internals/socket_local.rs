@@ -12,7 +12,6 @@
 //! The name comes from the socket in which a CPU is plugged in, as a recommendation to use one instance of SocketLocal
 //! for each socket.
 
-mod atomic_block_foreign_stack;
 mod huge_pages_manager;
 mod thread_locals_manager;
 
@@ -39,7 +38,6 @@ use crate::{
     utils,
 };
 
-use atomic_block_foreign_stack::AtomicBlockForeignStack;
 use huge_pages_manager::HugePagesManager;
 use thread_locals_manager::ThreadLocalsManager;
 

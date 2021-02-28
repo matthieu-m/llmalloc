@@ -10,3 +10,4 @@ pub mod socket_local;
 pub mod thread_local;
 
 mod atomic;
+mod atomic_stack;
