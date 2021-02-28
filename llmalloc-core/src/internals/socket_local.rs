@@ -29,10 +29,11 @@ use core::{
 use crate::{Category, ClassSize, Configuration, Platform, PowerOf2, Properties};
 use crate::{
     internals::{
+        atomic_stack::AtomicStack,
         blocks::{BlockForeign, BlockForeignList},
         huge_allocator::HugeAllocator,
         huge_page::HugePage,
-        large_page::{LargePage, LargePageStack},
+        large_page::LargePage,
         thread_local::{ThreadLocal},
     },
     utils,
@@ -46,7 +47,17 @@ use thread_locals_manager::ThreadLocalsManager;
 #[repr(C)]
 pub(crate) struct SocketLocal<'a, C, P> {
     //  Linked-lists of already allocated LargePages.
-    large_pages: [LargePageStack; 64],
+    //
+    //  AtomicStack is not entirely ABA-proof in case of concurrent pop vs pop+re-push. Here, it should work fine as
+    //  the delay between pop and re-push is large, considering that it involves:
+    //
+    //  -   Draining the page, and casting it adrift.
+    //  -   Freeing a large number of memory blocks, and catching it.
+    //
+    //  In a low-latency scenario, with uninterrupted threads, the chances of _that_ happening within the time another
+    //  thread takes to just execute pop are exceedingly low, and thus _hopefully_ the merkle-chain of AtomicStack will
+    //  be sufficient to guard against those rare cases.
+    large_pages: [AtomicStack<LargePage>; 64],
     //  Huge Pages allocated, to be carved into Large allocations.
     huge_pages: HugePagesManager<C, P>,
     //  Management of buffer area for ThreadLocals.
@@ -443,7 +454,7 @@ where
 
         //  Safety:
         //  -   `class_size` is within bounds.
-        socket.large_pages.get_unchecked(class_size.value()).push(page);
+        socket.large_pages.get_unchecked(class_size.value()).push(&mut *page.as_ptr());
     }
 }
 
@@ -751,7 +762,7 @@ fn socket_local_allocate_deallocate_normal_catch() {
     //  Deallocate 1 of the two allocations, the LargePage should be caught.
     unsafe { socket.deallocate(thread_local, allocations[0].unwrap()) };
 
-    assert_ne!(None, unsafe { socket.large_pages[class_size.value()].peek() });
+    assert!(!socket.large_pages[class_size.value()].is_empty());
 
     //  Further allocation is now possible!
     let further = unsafe { socket.allocate(thread_local, layout) };

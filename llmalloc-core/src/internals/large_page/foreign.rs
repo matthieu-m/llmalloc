@@ -2,10 +2,7 @@
 
 use core::ptr::NonNull;
 
-use crate::internals::{
-    atomic::AtomicPtr,
-    blocks::{AtomicBlockForeignList, BlockForeignList, BlockLocal},
-};
+use crate::internals::blocks::{AtomicBlockForeignList, BlockForeignList, BlockLocal};
 
 use super::{
     adrift::Adrift,
@@ -15,8 +12,6 @@ use super::{
 //  Foreign data. Accessible both from the local thread and foreign threads, at the cost of synchronization.
 #[repr(align(128))]
 pub(crate) struct Foreign {
-    //  Pointer to the next LargePage, type-erased, for use by LargePageStack.
-    pub(crate) next: AtomicPtr<()>,
     //  List of cells returned by other threads.
     freed: AtomicBlockForeignList,
     //  The adrift marker.
@@ -33,11 +28,10 @@ impl Foreign {
     pub(crate) fn new(catch_threshold: usize) -> Self {
         debug_assert!(catch_threshold >= 1);
 
-        let next = AtomicPtr::default();
         let freed = AtomicBlockForeignList::default();
         let adrift = Adrift::default();
 
-        Self { next, freed, adrift, catch_threshold, }
+        Self { freed, adrift, catch_threshold, }
     }
 
     /// Attempts to refill `local` from foreign, and allocate.

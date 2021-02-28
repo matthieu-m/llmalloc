@@ -21,7 +21,7 @@ use core::{
 use crate::{ClassSize, Configuration};
 use crate::{
     internals::{
-        atomic::AtomicPtr,
+        atomic_stack::{AtomicStackElement, AtomicStackLink},
         blocks::BlockForeignList,
     },
     utils,
@@ -205,74 +205,8 @@ impl LargePage {
     }
 }
 
-/// A linked-list of LargePages.
-#[derive(Default)]
-pub(crate) struct LargePageStack(AtomicPtr<LargePage>);
-
-impl LargePageStack {
-    /// Pops the head of the stack, it may be null.
-    pub(crate) fn pop(&self) -> Option<NonNull<LargePage>> {
-        let mut head = self.0.load();
-
-        loop {
-            let head_ptr = head?;
-
-            //  Safety:
-            //  -   `head_ptr` points to a valid instance.
-            //  -   The lifetime is bounded.
-            let next = unsafe { head_ptr.as_ref() }.foreign.next.load().map(NonNull::cast);
-
-            if let Err(new_head) = self.0.compare_exchange(head, next) {
-                head = new_head;
-                continue;
-            }
-
-            debug_assert!(!head.is_none());
-
-            //  Safety:
-            //  -   `head_ptr` points to a valid instance.
-            //  -   The lifetime is bounded.
-            //
-            //  Exclusive access to LargePage, so no data-race on store.
-            unsafe { head_ptr.as_ref() }.foreign.next.store(None);
-
-            return head;
-        }
-    }
-
-    /// Pushes the page at the head of the stack.
-    ///
-    /// #   Safety
-    ///
-    /// -   `page` must not be null.
-    /// -   `page.foreign.next` must be null.
-    pub(crate) fn push(&self, page: NonNull<LargePage>) {
-        //  Safety:
-        //  -   `page` points to a valid instance.
-        //  -   The lifetime is bounded.
-        let large_page = unsafe { page.as_ref() };
-
-        debug_assert!(large_page.foreign.next.load().is_none());
-
-        let mut head = self.0.load().map(NonNull::cast);
-
-        loop {
-            //  Exclusive access to LargePage, so no data-race on store.
-            large_page.foreign.next.store(head.map(NonNull::cast));
-
-            if let Err(new_head) = self.0.compare_exchange(head, Some(page)) {
-                head = new_head;
-                continue;
-            }
-
-            break;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) unsafe fn peek(&self) -> Option<NonNull<LargePage>> {
-        self.0.load()
-    }
+impl AtomicStackElement for LargePage {
+    fn next(&self) -> &AtomicStackLink<Self> { &self.common.next }
 }
 
 //
@@ -289,6 +223,8 @@ struct Common {
     //
     //  Outside tests, this should point to the SocketLocal from which the page was allocated.
     owner: *mut (),
+    //  A pointer to the _next_ LargePage, when used as a stack.
+    next: AtomicStackLink<LargePage>,
     //  The Class Size of the page, and thus all the properties of its cells.
     class_size: ClassSize,
     //  When the number of foreign cells in the ThreadLocal local list exceeds the flush threshold, then the list
@@ -315,7 +251,9 @@ impl Common {
     {
         debug_assert!(flush_threshold >= 1);
 
-        Self { owner, class_size, flush_threshold, begin, end, }
+        let next = AtomicStackLink::default();
+
+        Self { owner, next, class_size, flush_threshold, begin, end, }
     }
 
     /// Checks whether the pointer points to a Block within this page.
@@ -330,7 +268,7 @@ impl Common {
 mod tests {
 
 use core::{
-    mem::{self, MaybeUninit},
+    mem,
     ops,
     slice,
 };
@@ -349,23 +287,6 @@ fn implementation_sizes() {
     assert_eq!(128, mem::size_of::<Local>());
     assert_eq!(128, mem::size_of::<Foreign>());
     assert_eq!(4 * 128, mem::size_of::<LargePage>());
-}
-
-#[test]
-fn large_page_ptr() {
-    let other = NonNull::new(1234usize as *mut LargePage).unwrap();
-
-    let large_page = AtomicPtr::default();
-    assert_eq!(None, large_page.load());
-
-    large_page.store(Some(other));
-    assert_eq!(Some(other), large_page.load());
-
-    assert_eq!(Err(Some(other)), large_page.compare_exchange(None, Some(other)));
-    assert_eq!(Some(other), large_page.load());
-
-    assert_eq!(Ok(Some(other)), large_page.compare_exchange(Some(other), None));
-    assert_eq!(None, large_page.load());
 }
 
 #[test]
@@ -646,36 +567,6 @@ fn large_page_refill_foreign_adrift() {
         let new = unsafe { large_page.allocate() }.unwrap().as_ptr() as usize;
         assert_eq!(allocated[i], new);
     }
-}
-
-#[test]
-fn large_page_stack() {
-    let class_size = ClassSize::new(2);
-
-    let mut stores = [LargePageStore::default(); 6];
-
-    let pointers = {
-        let mut result: MaybeUninit<[NonNull<LargePage>; 6]> = MaybeUninit::uninit();
-
-        for i in 0..6 {
-            unsafe { (*result.as_mut_ptr())[i] = stores[i].initialize(class_size) };
-        }
-
-        unsafe { result.assume_init() }
-    };
-
-    let stack = LargePageStack::default();
-    assert_eq!(None, stack.pop());
-
-    for large_page in pointers.iter().rev() {
-        stack.push(*large_page);
-    }
-
-    for large_page in pointers.iter() {
-        assert_eq!(Some(*large_page), stack.pop());
-    }
-
-    assert_eq!(None, stack.pop());
 }
 
 } // mod tests

@@ -58,6 +58,12 @@ impl<T: AtomicStackElement> AtomicStack<T> {
     ///
     /// The returned `NonNull`, if any, is guaranteed to have exclusive access to its pointee.
     pub(crate) fn pop(&self) -> Option<NonNull<T>> {
+        //  WARNING:
+        //
+        //  Due to concurrency, another thread may start using the data pointed to be `head` prior to this call
+        //  terminating.
+        //
+        //  DO NOT WRITE to `head`/`current` before having exclusive ownership of it.
         let mut current = self.0.load();
 
         loop {
@@ -91,6 +97,12 @@ impl<T: AtomicStackElement> AtomicStack<T> {
         where
             'b: 'a,
     {
+        //  WARNING:
+        //
+        //  Due to concurrency, another thread may start using the data pointed to be `head` prior to this call
+        //  terminating.
+        //
+        //  DO NOT WRITE to `head`/`current`.
         let element = NonNull::from(element);
 
         let mut current = self.0.load();
