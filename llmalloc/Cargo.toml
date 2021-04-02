@@ -18,6 +18,8 @@ criterion = "0.3"
 num_cpus = "1.13.0"
 serial_test = "0.5.0"
 
+llmalloc-test = { path = "../llmalloc-test" }
+
 [[bench]]
 
 name = "benchmark"

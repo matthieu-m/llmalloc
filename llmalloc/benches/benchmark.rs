@@ -1,8 +1,15 @@
-use std::{alloc::Layout, collections::VecDeque, sync::{self, atomic}, thread, time};
+use std::{
+    alloc::Layout,
+    collections::VecDeque,
+    ptr::NonNull,
+    sync::atomic::{AtomicU64, Ordering},
+    time,
+};
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 
 use llmalloc::LLAllocator;
+use llmalloc_test::BurstyBuilder;
 
 static LL_ALLOCATOR: LLAllocator = LLAllocator::new();
 
@@ -306,64 +313,48 @@ fn bench_function_worst_of_parallel<F, S, T, V, Z>(
 {
     assert!(number_threads >= 1);
 
-    c.bench_function(name, |b| b.iter_custom(|iterations| {
-        let rendez_vous = RendezVous::new(number_threads);
+    c.bench_function(name, move |b| b.iter_custom(|iterations| {
         let measurements: Vec<_> = (0..number_threads)
-            .map(|_| sync::Arc::new(atomic::AtomicU64::new(0)))
+            .map(|_| AtomicU64::new(0))
             .collect();
 
-        let threads: Vec<_> = (0..number_threads)
-            .map(|index| {
-                let rendez_vous = rendez_vous.clone();
-                let measurement = measurements[index].clone();
-                let input = setup(iterations as usize);
-                let victim = factory();
+        let locals: Vec<_> = (0..number_threads).collect();
 
-                thread::spawn(move || {
-                    LL_ALLOCATOR.warm_up().expect("Warmed up");
+        let mut builder = BurstyBuilder::new(measurements, locals);
 
-                    rendez_vous.wait_until_all_ready();
+        builder.add_complex_step(|| {
+            let mut input = Some(setup(iterations as usize));
+            let mut victim = Some(factory());
 
-                    let start = time::Instant::now();
+            let prep = move |_: &Vec<AtomicU64>, _: &mut usize| -> (T, V) {
+                LL_ALLOCATOR.warm_up().expect("Warmed up");
 
-                    let _large_drop = black_box(victim(black_box(input)));
+                (input.take().unwrap(), victim.take().unwrap())
+            };
 
-                    let duration = start.elapsed();
+            let step = |measurements: &Vec<AtomicU64>, index: &mut usize, (input, victim): (T, V)| {
+                let start = time::Instant::now();
 
-                    measurement.store(duration.as_nanos() as u64, atomic::Ordering::Relaxed);
-                })
-            })
-            .collect();
+                let _large_drop = black_box(victim(black_box(input)));
 
-        for thread in threads {
-            thread.join().expect("Joined thread");
-        }
+                let duration = start.elapsed();
 
-        let duration = measurements.into_iter()
-            .map(|measurement| measurement.load(atomic::Ordering::Relaxed))
+                measurements[*index].store(duration.as_nanos() as u64, Ordering::Relaxed);
+            };
+
+            (prep, step)
+        });
+
+        let bursty = builder.launch(1);
+
+        let duration = bursty.global().into_iter()
+            .map(|measurement| measurement.load(Ordering::Relaxed))
             .map(|nanos| time::Duration::from_nanos(nanos))
             .max()
             .expect("At least one element");
 
         duration
     }));
-}
-
-#[derive(Clone, Debug)]
-struct RendezVous(sync::Arc<atomic::AtomicUsize>);
-
-impl RendezVous {
-    fn new(count: usize) -> Self {
-        Self(sync::Arc::new(atomic::AtomicUsize::new(count)))
-    }
-
-    fn wait_until_all_ready(&self) {
-        self.0.fetch_sub(1, atomic::Ordering::AcqRel);
-
-        while !self.is_ready() {}
-    }
-
-    fn is_ready(&self) -> bool { self.0.load(atomic::Ordering::Acquire) == 0 }
 }
 
 //
@@ -382,7 +373,7 @@ impl Vector for SysVec {
 
 //  Similar layout to Vec, for fairness.
 struct LLVec {
-    pointer: *mut u8,
+    pointer: NonNull<u8>,
     #[allow(dead_code)]
     len: usize,
     #[allow(dead_code)]
@@ -391,7 +382,7 @@ struct LLVec {
 
 impl Vector for LLVec {
     fn with_capacity(capacity: usize) -> LLVec {
-        let pointer = LL_ALLOCATOR.allocate(layout(capacity, 1));
+        let pointer = LL_ALLOCATOR.allocate(layout(capacity, 1)).unwrap();
         LLVec { pointer, len: 0, cap: capacity }
     }
 }
