@@ -222,11 +222,19 @@ impl<C> AtomicStackElement for MaybeThreadLocal<C> {
 #[cfg(test)]
 mod tests {
 
-use core::slice;
+use std::{
+    ptr,
+    slice,
+    sync::atomic::Ordering,
+};
+
+use llmalloc_test::BurstyBuilder;
 
 use super::*;
 use super::super::test::TestConfiguration;
 
+type TestGuardedThreadLocal = GuardedThreadLocal<TestConfiguration>;
+type TestThreadLocal = ThreadLocal<TestConfiguration>;
 type TestThreadLocalsManager = ThreadLocalsManager<TestConfiguration>;
 
 #[repr(align(128))]
@@ -296,6 +304,178 @@ fn thread_locals_acquire_release() {
     for ptr in thread_locals.iter().rev() {
         assert_eq!(*ptr, manager.acquire().unwrap().as_ptr());
     }
+}
+
+struct Global {
+    victim: TestThreadLocalsManager,
+    buffer: Vec<TestGuardedThreadLocal>,
+}
+
+impl Global {
+    fn new(n: usize) -> Global {
+        let mut buffer = vec!();
+        buffer.reserve(n);
+
+        let victim = TestThreadLocalsManager::new(ptr::null_mut(), Self::buffer(&mut buffer));
+
+        Self { victim, buffer, }
+    }
+
+    //  Safety:
+    //  -   No other method should be invoked concurrently.
+    //  -   When invoked concurrently, a single index should be 0.
+    unsafe fn reset(&self, index: usize) {
+        if index != 0 {
+            return;
+        }
+
+        //  Safety:
+        //  -   A single index is 0, hence temporarily access is exclusive.
+        let this: &mut Global = &mut *(self as *const _ as *mut _);
+
+        this.victim = TestThreadLocalsManager::new(ptr::null_mut(), Self::buffer(&mut this.buffer));
+    }
+
+    fn buffer(buffer: &mut Vec<TestGuardedThreadLocal>) -> &mut [u8] {
+        let pointer = buffer.as_mut_ptr() as *mut u8;
+        let size = buffer.capacity() * mem::size_of::<TestGuardedThreadLocal>();
+        
+        unsafe { slice::from_raw_parts_mut(pointer, size) }
+    }
+}
+
+unsafe impl Send for Global {}
+unsafe impl Sync for Global {}
+
+struct Local {
+    index: usize,
+    thread_local: Option<NonNull<TestThreadLocal>>,
+}
+
+impl Local {
+    fn vec(n: usize) -> Vec<Local> {
+        (0..n).map(|index| Local::new(index)).collect()
+    }
+
+    fn new(index: usize) -> Self { Self { index, thread_local: None, } }
+
+    fn is_even(&self) -> bool { self.index % 2 == 0 }
+
+    fn acquire(&mut self, global: &Global) {
+        debug_assert_eq!(None, self.thread_local);
+
+        self.thread_local = global.victim.acquire();
+
+        assert_ne!(None, self.thread_local);
+    }
+
+    fn release(&mut self, global: &Global) {
+        debug_assert_ne!(None, self.thread_local);
+
+        if let Some(thread_local) = self.thread_local.take() {
+            unsafe { global.victim.release(thread_local) };
+        }
+    }
+}
+
+unsafe impl Send for Local {}
+
+#[test]
+fn thread_locals_acquire_concurrent_watermark_fuzzing() {
+    //  This test aims at testing that multiple threads can bump the watermark in a concurrent fashion.
+    const THREADS: usize = 4;
+
+    let mut builder = BurstyBuilder::new(Global::new(THREADS), vec!(0usize, 1, 2, 3));
+
+    //  Step 1: Reset the victim.
+    builder.add_simple_step(|| |global: &Global, local: &mut usize| {
+        unsafe { global.reset(*local) };
+    });
+
+    //  Step 2: Concurrently attempt to acquire a thread-local.
+    builder.add_simple_step(|| |global: &Global, _: &mut usize| {
+        let acquired = global.victim.acquire();
+        assert_ne!(None, acquired);
+    });
+
+    //  Step 3: Check watermark.
+    builder.add_simple_step(|| |global: &Global, _: &mut usize| {
+        const THREAD_SIZE: usize = mem::size_of::<TestGuardedThreadLocal>();
+
+        let begin = global.victim.begin.as_ptr() as usize;
+        let end = global.victim.end.as_ptr() as usize;
+        let watermark = global.victim.watermark.load(Ordering::Relaxed) as usize;
+
+        assert!(begin <= end, "{:x} > {:x}", begin, end);
+        assert!(begin <= watermark, "{:x} > {:x}", begin, watermark);
+        assert!(watermark <= end, "{:x} > {:x}", watermark, end);
+
+        assert_eq!(THREADS * THREAD_SIZE, watermark - begin,
+            "Expected {}, got {}", THREADS, (watermark - begin) / THREAD_SIZE);
+    });
+
+    builder.launch(100);
+}
+
+#[test]
+fn thread_locals_acquire_release_concurrent_fuzzing() {
+    //  This test aims at testing that multiple threads can acquire and release in parallel.
+    //
+    //  To do so:
+    //  1.  First, odd threads will acquire a thread-local.
+    //  2.  Repeatedly, even threads will acquire while odd threads release.
+    //  3.  Then, odd threads will acquire while even threads release.
+    const THREADS: usize = 4;
+
+    let global = Global::new(THREADS);
+    let mut locals = Local::vec(THREADS);
+
+    for local in &mut locals {
+        if local.is_even() {
+            continue;
+        }
+
+        local.acquire(&global);
+    }
+
+    let mut builder = BurstyBuilder::new(global, locals);
+
+    //  Step 1: Even acquire, odd release.
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        if local.is_even() {
+            local.acquire(global);
+        } else {
+            local.release(global);
+        }
+    });
+
+    //  Step 2: Odd acquire, even release
+    builder.add_simple_step(|| |global: &Global, local: &mut Local| {
+        if local.is_even() {
+            local.release(global);
+        } else {
+            local.acquire(global);
+        }
+    });
+
+    //  Step 3: Check watermark.
+    builder.add_simple_step(|| |global: &Global, _: &mut Local| {
+        const THREAD_SIZE: usize = mem::size_of::<TestGuardedThreadLocal>();
+
+        let begin = global.victim.begin.as_ptr() as usize;
+        let end = global.victim.end.as_ptr() as usize;
+        let watermark = global.victim.watermark.load(Ordering::Relaxed) as usize;
+
+        assert!(begin <= end, "{:x} > {:x}", begin, end);
+        assert!(begin <= watermark, "{:x} > {:x}", begin, watermark);
+        assert!(watermark <= end, "{:x} > {:x}", watermark, end);
+
+        //  Some thread-locals may be recycled, if released before an acquisition takes place.
+        assert!(THREADS * THREAD_SIZE >= watermark - begin,
+            "Expected {}, got {}", THREADS, (watermark - begin) / THREAD_SIZE);
+    });
+
+    builder.launch(100);
 }
 
 } // mod tests
