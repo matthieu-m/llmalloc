@@ -1,9 +1,10 @@
 use std::{
     alloc::Layout,
+    cmp,
     collections::VecDeque,
     ptr::NonNull,
     sync::atomic::{AtomicU64, Ordering},
-    time,
+    time::{Duration, Instant},
 };
 
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
@@ -50,12 +51,12 @@ fn single_threaded_single_allocation_deallocation(c: &mut Criterion) {
     //  -   Printing 1% and 99% percentiles show a range from 5us to 13us !?!?
     fn bencher<T: Vector>(name: &str, c: &mut Criterion) {
         c.bench_function(name, |b| b.iter_custom(|iterations| {
-            let mut duration = time::Duration::default();
+            let mut duration = Duration::default();
 
             for _ in 0..iterations {
                 let v = black_box(T::with_capacity(32));
 
-                let start = time::Instant::now();
+                let start = Instant::now();
 
                 std::mem::drop(v);
 
@@ -333,7 +334,7 @@ fn bench_function_worst_of_parallel<F, S, T, V, Z>(
             };
 
             let step = |measurements: &Vec<AtomicU64>, index: &mut usize, (input, victim): (T, V)| {
-                let start = time::Instant::now();
+                let start = Instant::now();
 
                 let _large_drop = black_box(victim(black_box(input)));
 
@@ -347,13 +348,15 @@ fn bench_function_worst_of_parallel<F, S, T, V, Z>(
 
         let bursty = builder.launch(1);
 
+        bursty.join();
+
         let duration = bursty.global().into_iter()
             .map(|measurement| measurement.load(Ordering::Relaxed))
-            .map(|nanos| time::Duration::from_nanos(nanos))
+            .map(|nanos| Duration::from_nanos(nanos))
             .max()
             .expect("At least one element");
 
-        duration
+        cmp::max(duration, Duration::from_nanos(1))
     }));
 }
 
