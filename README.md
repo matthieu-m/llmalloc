@@ -41,21 +41,23 @@ This repository contains 3 libraries:
 -   llmalloc: an opinionated implementation.
 -   llmalloc-c: C bindings for llmalloc.
 
-##  Maturity -- or lack, thereof
+##  Maturity
 
-llmalloc is not mature; of note:
+llmalloc is in _alpha_ state; of note:
 
 -   llmalloc-core:
     -   Audit: not audited.
-    -   Benchmarks: not benchmarked.
-    -   Fuzzing: not fuzzed.
-    -   Testing: good single-thread unit-test support, no multi-thread unit-tests at all.
+    -   Fuzzing: fuzzed.
+    -   Testing: good single-thread and multi-thread unit-test support.
 
 -   llmalloc:
     -   Audit: not audited.
-    -   Benchmarks: one lone single-threaded benchmark, just to validate that performance is not completely lacking.
-    -   Fuzzing: not fuzzed.
-    -   Testing: one lone single-threaded integration test, just to validate that it may yet work.
+    -   Benchmarks: benchmarked, with performance on par or better than the system allocator.
+    -   Fuzzing: fuzzed.
+    -   Testing: one single-threaded integration test.
+
+The library is ready to be trialed in realistic setups, but is not mature enough to drop in in a production application
+without a qualification phase.
 
 ##  Design Sketch
 
